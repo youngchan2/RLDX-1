@@ -40,7 +40,9 @@ _path.setup(__file__)
 # Imports
 from engine import (  # noqa: E402
     build_custom_memory_chain,
+    build_libra_memory_chain, 
     compile_custom_memory_chain,
+    compile_libra_memory_chain,
     setup_cuda_graph,
 )
 
@@ -133,7 +135,10 @@ def main():
     def make_fn(module):
         def fn():
             with torch.no_grad():
-                return module(inputs_embeds)
+                out = module(inputs_embeds)
+                # Path A (vanilla TransformerMemory) returns BaseModelOutputWithPast;
+                # Paths C/D return a tensor. Unwrap so all paths yield a tensor.
+                return getattr(out, "last_hidden_state", out)
 
         return fn
 
@@ -227,6 +232,35 @@ def main():
         build_times["D: MemoryChain"] = chain_compile_time
 
         run_benchmark("D: CustomMemoryChain", make_fn(compiled_chain))
+    except Exception as e:
+        print(f"  [MemoryChain] Failed: {e}")
+        traceback.print_exc()
+    
+    # =========================================================================
+    # Path E: LibraMemoryChain + torch.compile
+    # =========================================================================
+    print(f"\n{'=' * 60}")
+    print("Path E: LibraMemoryChain + torch.compile")
+    print(f"{'=' * 60}")
+    try:
+        if "gs_memory" not in locals():
+            gs_memory = GraphSafeMemory(
+                memory_module=memory_module,
+                memory_length=K,
+                memory_n_cog_tokens=n_cog_mem,
+                device=device,
+                dtype=dtype,
+            ).eval()
+
+        print("  Building LibraMemoryChain...")
+        libra_chain = build_libra_memory_chain(gs_memory, device=device, dtype=dtype)
+
+        compiled_chain, chain_compile_time = compile_libra_memory_chain(
+            libra_chain, inputs_embeds, compile_mode=args.compile_mode
+        )
+        build_times["E: MemoryChain"] = chain_compile_time
+
+        run_benchmark("E: LibraMemoryChain", make_fn(compiled_chain))
     except Exception as e:
         print(f"  [MemoryChain] Failed: {e}")
         traceback.print_exc()

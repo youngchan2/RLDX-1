@@ -1,6 +1,6 @@
-"""CustomMemoryChain: fused TransformerMemory pipeline as a single nn.Module.
+"""LibraMemoryChain: fused TransformerMemory pipeline as a single nn.Module.
 
-Mirrors VLM's CustomLLMChain pattern, adapted for Memory:
+Mirrors VLM's LibraLLMChain pattern, adapted for Memory:
   - Fused QKV GEMM (cuBLAS)
   - mem::fused_attention (Triton: RoPE + block-causal SDPA)
   - mem::fused_epilogue_add2_rmsnorm (Triton: residual add + RMSNorm)
@@ -40,10 +40,10 @@ class MemoryLayerParam(nn.Module):
         self.register_buffer("down_proj_weight", layer.mlp.down_proj.weight.data)
 
 
-class CustomMemoryChain(nn.Module):
+class LibraMemoryChain(nn.Module):
     """Chain of fused TransformerDecoderLayers for TransformerMemory.
 
-    Uses custom Triton ops for attention and cross-layer epilogue fusion.
+    Uses libra ops for attention and cross-layer epilogue fusion.
     cuBLAS GEMMs (via F.linear) for projections and MLP.
     torch.compile optimizes and fuses remaining PyTorch ops.
 
@@ -60,10 +60,8 @@ class CustomMemoryChain(nn.Module):
         self.num_heads = memory.config.num_attention_heads
         self.head_dim = memory.hidden_size // self.num_heads
         self.block_attn_size = memory.block_attn_size
-        # mem::fused_attention only implements BLOCK-causal. The eager model uses
-        # a STANDARD causal mask when use_causal_attn=True (block_attn_size only
-        # gates the non-causal block-attention path). Standard causal ==
-        # block-causal with block=1, so pass 1 to the kernel in that case.
+        # libra_fused_attention only implements BLOCK-causal; standard causal
+        # (use_causal_attn=True) == block-causal with block=1. Pass 1 in that case.
         self.attn_block_size = 1 if memory.use_causal_attn else memory.block_attn_size
 
         self.layers = nn.ModuleList([MemoryLayerParam(layer) for layer in memory.layers])
@@ -101,8 +99,8 @@ class CustomMemoryChain(nn.Module):
             # 1. QKV projection — single fused GEMM (cuBLAS)
             qkv = F.linear(normed.view(M, D), layer.qkv_weight)  # (M, QKV_DIM)
 
-            # 2. Fused attention — Triton (RoPE + block-causal SDPA)
-            attn_out = torch.ops.mem.fused_attention(
+            # 2. Libra Fused attention — CUDA (RoPE + block-causal SDPA)
+            attn_out = torch.ops.mem.libra_fused_attention(
                 qkv,
                 cos,
                 ssin,
@@ -139,23 +137,23 @@ class CustomMemoryChain(nn.Module):
         return self.norm(hidden_states)
 
 
-def build_custom_memory_chain(gs_memory, device=None, dtype=torch.bfloat16):
-    """Build a CustomMemoryChain from a GraphSafeMemory (no compilation).
+def build_libra_memory_chain(gs_memory, device=None, dtype=torch.bfloat16):
+    """Build a LibraMemoryChain from a GraphSafeMemory (no compilation).
 
     Args:
         gs_memory: GraphSafeMemory instance
 
     Returns:
-        CustomMemoryChain (uncompiled)
+        LibraMemoryChain (uncompiled)
     """
-    return CustomMemoryChain(gs_memory, device=device, dtype=dtype).eval()
+    return LibraMemoryChain(gs_memory, device=device, dtype=dtype).eval()
 
 
-def compile_custom_memory_chain(chain, sample_input, compile_mode="max-autotune", fullgraph=True):
-    """Compile a CustomMemoryChain with torch.compile and trigger compilation.
+def compile_libra_memory_chain(chain, sample_input, compile_mode="max-autotune", fullgraph=True):
+    """Compile a LibraMemoryChain with torch.compile and trigger compilation.
 
     Args:
-        chain: CustomMemoryChain instance
+        chain: LibraMemoryChain instance
         sample_input: (B, S, D) tensor for warmup
         compile_mode: torch.compile mode
         fullgraph: when True (default) torch.compile errors on any
