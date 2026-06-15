@@ -321,6 +321,15 @@ class _CompiledDispatcher:
             prefix_len=self.bake_prefix_len,
         )
         self._gs_vla = gs_vla
+        # Pad id for instruction refresh (update_input_ids) in the hot path.
+        self._pad_id = getattr(gs_vla.gs_backbone, "pad_token_id", 151643)
+        # When False (default), only a SAME-LENGTH instruction change is served
+        # on the fast path (bit-exact); a different-length instruction falls
+        # back to vanilla. Set True to allow approximate right-padding instead.
+        self._allow_approx_pad = False
+        # Path-D bakes embeddings in the custom backbone chain; the hot path
+        # refreshes that chain directly. Set when path == "D" (see below).
+        self._backbone_chain = None
 
         action_model = self.full_model.action_model
         self._action_dim = action_model.action_decoder.layer2.W.shape[2]
@@ -377,6 +386,8 @@ class _CompiledDispatcher:
                 bake_prefix_len=self.bake_prefix_len,
             )
             self._has_physics = chain.__class__.__name__.startswith("CustomExpanded")
+            # Hot-path instruction refresh targets the baked backbone chain.
+            self._backbone_chain = chain.backbone_chain
             prefix_buf = self._buffers.get("prefix_actions")
             if prefix_buf is not None:
                 sample = (pv_buf, state_buf, emb_buf, init_noise_buf, prefix_buf)
@@ -460,6 +471,30 @@ class _CompiledDispatcher:
                 else action_inputs.embodiment_id
             )
             emb = emb.to(torch.long).contiguous()
+
+            # Instruction refresh: the captured graph / compiled chain otherwise
+            # keep the instruction baked on the first request. Write the new
+            # input_ids into the baked buffer (in place, so the graph picks it
+            # up on replay). Falls back to eager when the new instruction can't
+            # be mapped onto the baked layout — longer than the baked window, or
+            # image tokens shifted (which would invalidate the static
+            # position_ids / image mask / compression indices).
+            new_ids = backbone_inputs["input_ids"]
+            if self.path == "D":
+                tok_ok = self._backbone_chain.update_input_ids(
+                    new_ids, pad_token_id=self._pad_id, allow_approx_pad=self._allow_approx_pad
+                )
+            else:
+                tok_ok = self._gs_vla.gs_backbone.update_input_ids(
+                    new_ids, pad_token_id=self._pad_id, allow_approx_pad=self._allow_approx_pad
+                )
+            if not tok_ok:
+                _print(
+                    f"[Path{self.path}] Instruction layout drift "
+                    "(length/image-position changed); vanilla fallback.",
+                    flush=True,
+                )
+                return self._orig_get_action(**collated_inputs)
 
             # Shape drift would corrupt the captured graph — fall back to vanilla.
             for k, new in [("pixel_values", pv), ("state", st), ("embodiment_id", emb)]:

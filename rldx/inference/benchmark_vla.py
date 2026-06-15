@@ -8,6 +8,7 @@ Benchmark paths (always run in order):
   B: Torch Inductor (vanilla)       — torch.compile on vanilla sub-modules (compiler only)
   C: GraphSafe + CUDA Graph         — GraphSafe wrapping + CUDA Graph capture
   D: Custom Chain                   — GraphSafe + custom Triton kernels + torch.compile
+  E: Hybrid (B + D)                 — VLM via Inductor (Path B) + Action head via Custom Chain (Path D)
 
 Usage:
   python inference/benchmark_vla.py
@@ -185,21 +186,31 @@ def build_graph_safe_vla(backbone, action_model, vl_input, args, meta, device, d
             dtype=dtype,
         ).eval()
 
-        # Run memory once to determine output n_vl
-        n_q = memory_config["n_cog_tokens"]
+        # Run memory once to determine output n_vl. The memory expects a sequence
+        # of exactly K * memory_n_cog_tokens. The cog tokens sit at the tail of the
+        # VLM output, whose length varies by model (e.g. 234 after compression for
+        # midtrain variants) and is NOT equal to n_cog_tokens — so slice the trailing
+        # n_cog_mem tokens directly and tile across K timesteps.
         n_cog_mem = memory_config["memory_n_cog_tokens"]
         K = memory_config["memory_length"]
-        cog_current = vl_out[:, (n_q - n_cog_mem) :, :]
+        cog_current = vl_out[:, -n_cog_mem:, :]
         dummy_cache = cog_current.repeat(1, K, 1)
         with torch.no_grad():
             gs_memory(dummy_cache)
 
+        # n_vl must equal what _process_memory returns at runtime (the action
+        # model's actual VL length), NOT n_vl_raw. _process_memory keeps the last
+        # n_cog_tokens (n_q) cog tokens and concatenates/keeps n_cog_mem augmented
+        # tokens — so it depends on n_q, not on n_vl_raw (=234 here after compression).
+        n_q = memory_config["n_cog_tokens"]
         if memory_config["concat_memory"]:
-            n_vl = n_vl_raw + n_cog_mem
+            n_vl = n_q + n_cog_mem            # cat([cog_all(n_q), augmented(n_cog_mem)])
+        elif (n_q - n_cog_mem) > 0:
+            n_vl = n_q                        # cat([cog_all[:n_cog_pass], augmented])
         else:
-            n_vl = n_vl_raw
+            n_vl = n_cog_mem                  # augmented only
         print(
-            f"  Memory: n_vl_raw={n_vl_raw} → n_vl={n_vl} "
+            f"  Memory: n_vl_raw={n_vl_raw}, n_cog_tokens={n_q} → n_vl={n_vl} "
             f"(concat={memory_config['concat_memory']}, +{n_cog_mem} augmented)"
         )
     else:
@@ -247,6 +258,14 @@ def main():
         rtc_inference_delay=args.rtc_inference_delay,
     )
     full_model = meta["full_model"]
+
+    # Capture the pristine (vanilla) VLM sub-modules before any GraphSafe build
+    # mutates ``backbone.qwen_model.model`` in place. Path E (the flexible
+    # hybrid) restores these so its VLM runs the instruction-flexible vanilla
+    # forward instead of the GraphSafe (instruction-frozen) one.
+    _vanilla_inner_model = backbone.qwen_model.model
+    _orig_visual = _vanilla_inner_model.visual
+    _orig_language_model = _vanilla_inner_model.language_model
 
     # ---- Generate synthetic input ----
     # ``processor_path`` resolution order:
@@ -525,8 +544,14 @@ def main():
             pv = pv.reshape(-1, pv.shape[-1])
         pv = pv.type(gs_vla.gs_backbone.gs_visual.dtype)
 
-        # Reuse global init_noise (same as all other paths)
-        sample_inputs = (pv, state, embodiment_id, init_noise)
+        # Reuse global init_noise (same as all other paths). Expanded (physics)
+        # chains unpack physics_hist + physics_init_noise; the VLA bakes physics_hist
+        # (no benchmark path passes it at runtime — see make_fn), so include it as
+        # None to match the expected arity.
+        if use_physics:
+            sample_inputs = (pv, state, embodiment_id, init_noise, None, physics_init_noise)
+        else:
+            sample_inputs = (pv, state, embodiment_id, init_noise)
 
         # 3. Compile as single unit
         compiled_vla, compile_time = compile_custom_vla_chain(
@@ -548,12 +573,89 @@ def main():
         traceback.print_exc()
 
     # =========================================================================
+    # Path E: Hybrid — VLM via Inductor (Path B) + Action head via Custom Chain (Path D)
+    # =========================================================================
+    # The instruction lives in the VLM. GraphSafe (Paths C/D) bakes input_ids
+    # into static buffers (fixed length + frozen tokens) — that is what enables
+    # CUDA Graph but freezes the instruction. To keep the instruction flexible
+    # (the Slack-thread compromise), the VLM here uses the VANILLA backbone +
+    # torch.compile (true Path B), NOT the GraphSafe backbone. The action head
+    # does not depend on the instruction, so it still takes the full custom
+    # chain (Path D). Measured end-to-end for comparison against A/B/C/D.
+    print(f"\n{'=' * 60}")
+    print("Path E: Hybrid (VLM=vanilla+Inductor / Action=CustomChain)")
+    print(f"{'=' * 60}")
+    try:
+        if meta.get("use_physics", False):
+            # The action-only custom chain would need the physics_hist wiring
+            # the unified VLA chain bakes internally — use Path D for add-on
+            # (physics/memory) models instead.
+            print("  [Hybrid] add-on (physics) models unsupported in Path E — skipping.")
+        else:
+            # Action side: reuse (or build) the GraphSafe action model. It wraps
+            # only the action head and does NOT touch the backbone.
+            if "gs_vla" not in locals():
+                gs_vla = build_graph_safe_vla(
+                    backbone, action_model, vl_input, args, meta, device, dtype
+                )
+            gs_action_model = gs_vla.gs_action_model
+
+            # VLM side: restore the pristine vanilla VLM (undo the in-place
+            # GraphSafe swap done by Paths C/D) so the backbone reads runtime
+            # input_ids — i.e. the instruction stays changeable.
+            inner_model = backbone.qwen_model.model
+            inner_model.visual = _orig_visual
+            inner_model.language_model = _orig_language_model
+
+            torch._dynamo.reset()
+            t0 = _time.time()
+
+            # --- VLM (Path B): compile the vanilla LLM decoder layers in-place,
+            # no CUDA graph; vision tower stays eager. Same recipe as Path B.
+            _vlm_compile_mode = "max-autotune-no-cudagraphs"
+            llm_e = inner_model.language_model
+            for i, layer in enumerate(llm_e.layers):
+                inner = layer.layer if hasattr(layer, "layer") else layer
+                compiled_layer = torch.compile(inner, mode=_vlm_compile_mode)
+                if hasattr(layer, "layer"):
+                    layer.layer = compiled_layer
+                else:
+                    llm_e.layers[i] = compiled_layer
+
+            # --- Action head (Path D): custom action-head chain, compiled.
+            from action_model.engine.custom_action_model_chain import CustomActionHeadChain
+
+            custom_ah = CustomActionHeadChain(gs_action_model, device=device, dtype=dtype).eval()
+            compiled_ah = torch.compile(custom_ah, mode=args.compile_mode)
+
+            # vl_embs comes from the vanilla (compiled) backbone — the adapter
+            # returns the projected cog tokens under "backbone_features".
+            def hybrid_fn(vl_in, st, emb, init_noise=None, physics_init_noise=None):
+                vl_embs = backbone(vl_in)["backbone_features"]
+                return compiled_ah(vl_embs, st, emb, init_noise=init_noise)
+
+            # Trigger compilation (VLM layers + action chain)
+            with torch.no_grad():
+                hybrid_fn(vl_input, state, embodiment_id, init_noise=init_noise)
+            torch.cuda.synchronize()
+            build_times["E: Hybrid (B+D)"] = _time.time() - t0
+            print(f"  Build (VLM compile + action chain): {build_times['E: Hybrid (B+D)']:.1f}s")
+
+            run_benchmark("E: Hybrid VLM-B + Action-D", make_fn(hybrid_fn))
+
+            torch._dynamo.reset()
+    except Exception as e:
+        print(f"  [Hybrid] Failed: {e}")
+        traceback.print_exc()
+
+    # =========================================================================
     # Report
     # =========================================================================
     print()
     print("=" * 80)
     print("VLA Full Pipeline Benchmark")
     print("=" * 80)
+    print(f"Device: {torch.cuda.get_device_name(device)}")
     print(f"Model: {args.model_type}")
     print(
         f"VLM: hidden={meta['hidden_size']}, llm_layers={meta['num_llm_layers']}, "

@@ -69,6 +69,9 @@ class CustomVLMChain(nn.Module):
         # Context compression
         compress_begin_idx=-1,  # Python int — start of image region (-1 = no compression)
         compress_end_idx=-1,  # Python int — end of image region
+        # Runtime instruction refresh
+        image_token_id=None,  # int — id of <|image_pad|> (enables update_input_ids)
+        pad_token_id=None,  # int — pad id for shorter instructions
     ):
         super().__init__()
 
@@ -88,6 +91,12 @@ class CustomVLMChain(nn.Module):
         self.register_buffer("static_input_ids", static_input_ids)
         self.register_buffer("static_token_embeds", static_token_embeds)
         self.register_buffer("image_mask_3d", image_mask_3d)
+
+        # Runtime instruction refresh (see update_input_ids)
+        self.image_token_id = image_token_id
+        self.pad_token_id = pad_token_id if pad_token_id is not None else 151643
+        self.special_id_min = 151643  # Qwen3 special-token floor (see backbone)
+        self.register_buffer("image_mask_2d", image_mask_3d[:, :, 0].clone())
 
         # cog-token
         self.n_cog_tokens = n_cog_tokens
@@ -198,6 +207,60 @@ class CustomVLMChain(nn.Module):
 
         # Projection
         return self.qwen_linear(out)
+
+    # ------------------------------------------------------------------
+    # Runtime instruction refresh (graph-safe)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def update_input_ids(self, new_input_ids, pad_token_id=None, allow_approx_pad=False):
+        """Path-D analogue of ``GraphSafeQwen3VLBackbone.update_input_ids``.
+
+        Path D bakes the token embeddings (``static_full_inputs_embeds``)
+        rather than gathering ``static_input_ids`` at forward time, so a
+        refresh means recomputing those embeddings for the text region. The
+        ``forward`` copies ``static_full_inputs_embeds`` into a work buffer and
+        scatters the image features in, so updating it in place is picked up by
+        the compiled graph on the next replay. Image rows are overwritten by
+        the runtime scatter and the cog tail is a separate static buffer, so
+        only the first ``L_ids`` rows are touched.
+
+        Same exact / approximate regimes and guards as the GraphSafe backbone
+        (see its ``update_input_ids``): same-length text-only change is exact;
+        a shorter instruction is served approximately only when
+        ``allow_approx_pad`` is set; longer / layout-drifting inputs return
+        ``False`` so the caller falls back to vanilla.
+        """
+        if self.image_token_id is None:
+            return False
+        B, L = self.static_input_ids.shape
+        ids = new_input_ids
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+        ids = ids.to(device=self.static_input_ids.device, dtype=self.static_input_ids.dtype)
+        if ids.shape[0] != B:
+            return False
+
+        if ids.shape[1] == L:
+            special = self.static_input_ids >= self.special_id_min
+            if not torch.equal(ids[special], self.static_input_ids[special]):
+                return False
+            if bool((ids[~special] >= self.special_id_min).any()):
+                return False
+        elif ids.shape[1] < L and allow_approx_pad:
+            pad = pad_token_id if pad_token_id is not None else self.pad_token_id
+            ids = torch.cat([ids, ids.new_full((B, L - ids.shape[1]), pad)], dim=1)
+            if not torch.equal(ids == self.image_token_id, self.image_mask_2d):
+                return False
+        else:
+            return False
+
+        self.static_input_ids.copy_(ids)
+        # Refresh the baked token embeddings (text region only). [:L] = token
+        # rows; image rows get scattered at runtime, cog rows [L:] stay fixed.
+        tok_emb = self.embed_tokens(self.static_input_ids).to(self.static_full_inputs_embeds.dtype)
+        self.static_full_inputs_embeds[:, :L, :].copy_(tok_emb)
+        return True
 
     def _static_compress(self, hidden_states):
         """Static context compression replacing VTC LayerWrapper.
@@ -544,6 +607,8 @@ def build_custom_backbone_chain(vlm_model, device=None, dtype=torch.bfloat16):
         static_cog_emb=static_cog_emb,
         compress_begin_idx=compress_begin_idx,
         compress_end_idx=compress_end_idx,
+        image_token_id=getattr(vlm_model, "image_token_id", None),
+        pad_token_id=getattr(vlm_model, "pad_token_id", None),
     )
 
     _print("  [VLMChain] Built successfully")

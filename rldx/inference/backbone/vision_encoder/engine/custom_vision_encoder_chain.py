@@ -27,9 +27,13 @@ Qwen3VLVisionBlock structure (per block):
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from utils.device_caps import is_server_class
 
 
 class VisionLayerParam(nn.Module):
@@ -116,6 +120,26 @@ class CustomVisionEncoderChain(nn.Module):
         self.register_buffer("cu_seqlens", cu_seqlens)
         self.max_seqlen = max_seqlen
 
+        # Attention backend selection (resolved at build, before compile/capture —
+        # graph-safe). On server-grade GPUs (A100 sm_80 / H100 sm_90) the custom
+        # 5090-era Triton flash kernel is ~5-12x SLOWER than cuDNN/FlashAttention
+        # routed via F.sdpa (head_dim=72 pads to BLOCK_D=128 and tl.dot can't match
+        # WGMMA/TMA). So prefer the RoPE+sdpa path there and let torch.compile fuse
+        # RoPE + dispatch FA-3 (H100) / FA-2 (A100). Consumer Blackwell (sm_120),
+        # where cuDNN-FA is unavailable, keeps the custom kernel.
+        #   RLDX_VISION_ATTN = auto (default) | sdpa | custom
+        _mode = os.environ.get("RLDX_VISION_ATTN", "auto").lower()
+        if _mode == "sdpa":
+            self._use_sdpa = True
+        elif _mode == "custom":
+            self._use_sdpa = False
+        else:
+            self._use_sdpa = is_server_class()
+        # RLDX uses a fixed uniform grid_thw → equal-length per-image seqs, so the
+        # block-diagonal attention reshapes to a dense batch (matches the custom
+        # kernel's own seq_len = M // num_seqs assumption).
+        self._num_seqs = int(cu_seqlens.numel() - 1)
+
         # Motion (all add-ons): inserted after motion_insert_layer
         # MotionBlock expects (B*V*T*P, D) with grid_sizes=(B*V, 3)
         # Vision encoder hidden_states are (B*T*V*P, D) — need T↔V permute
@@ -176,6 +200,38 @@ class CustomVisionEncoderChain(nn.Module):
         motion_out = self.motion_block(motion_in, self.motion_grid_sizes)
         return motion_out.index_select(0, restore_idx)
 
+    def _sdpa_attention(self, qkv, scaling, num_heads, head_dim):
+        """Server path: baked-RoPE (inline, inductor-fused) + F.sdpa (cuDNN/FA).
+
+        Numerically matches ``rldx_backbone::vision_attention`` (cos_sim≈1.0):
+        ``rope_sin`` already has the rotate_half sign baked in, so RoPE is
+        ``q*cos + swap_half(q)*rope_sin`` where ``swap_half`` swaps the two
+        head halves WITHOUT negation. Equal-length seqs reshape to a dense
+        ``(num_seqs, H, S, D)`` batch (no mask needed — attention is per-image).
+        """
+        M = qkv.shape[0]
+        QD = num_heads * head_dim
+        nseq = self._num_seqs
+        S = M // nseq
+        half = head_dim // 2
+
+        q = qkv[:, :QD].reshape(M, num_heads, head_dim).float()
+        k = qkv[:, QD : 2 * QD].reshape(M, num_heads, head_dim).float()
+        v = qkv[:, 2 * QD : 3 * QD].reshape(M, num_heads, head_dim)
+
+        cos = self.rope_cos.view(M, 1, head_dim)
+        sin = self.rope_sin.view(M, 1, head_dim)
+        q_sw = torch.cat((q[..., half:], q[..., :half]), dim=-1)
+        k_sw = torch.cat((k[..., half:], k[..., :half]), dim=-1)
+        q = (q * cos + q_sw * sin).to(v.dtype)
+        k = (k * cos + k_sw * sin).to(v.dtype)
+
+        q = q.reshape(nseq, S, num_heads, head_dim).transpose(1, 2)
+        k = k.reshape(nseq, S, num_heads, head_dim).transpose(1, 2)
+        v = v.reshape(nseq, S, num_heads, head_dim).transpose(1, 2)
+        out = F.scaled_dot_product_attention(q, k, v, scale=scaling)
+        return out.transpose(1, 2).reshape(M, QD)
+
     def forward(self, hidden_states):
         """Run VisionBlocks + merger with fused RoPE + non-causal varlen attention.
 
@@ -200,17 +256,23 @@ class CustomVisionEncoderChain(nn.Module):
             # 2. QKV projection → fused (M, 3 * num_heads * head_dim)
             qkv = F.linear(normed, layer.qkv_weight, layer.qkv_bias)
 
-            # 3. Fused attention: baked RoPE + non-causal varlen attention
-            #    Kernel reads Q/K/V directly from qkv (no permute/reshape copy).
-            attn_out = torch.ops.rldx_backbone.vision_attention(
-                qkv,
-                self.rope_cos,
-                self.rope_sin,
-                self.cu_seqlens,
-                layer.scaling,
-                layer.num_heads,
-                layer.head_dim,
-            )  # (M, num_heads * head_dim)
+            # 3. Attention: baked RoPE + non-causal per-image attention.
+            #    Server GPUs → RoPE+F.sdpa (cuDNN/FA, ~5x faster); consumer
+            #    Blackwell → custom fused Triton kernel.
+            if self._use_sdpa:
+                attn_out = self._sdpa_attention(
+                    qkv, layer.scaling, layer.num_heads, layer.head_dim
+                )
+            else:
+                attn_out = torch.ops.rldx_backbone.vision_attention(
+                    qkv,
+                    self.rope_cos,
+                    self.rope_sin,
+                    self.cu_seqlens,
+                    layer.scaling,
+                    layer.num_heads,
+                    layer.head_dim,
+                )  # (M, num_heads * head_dim)
 
             # 4. O projection + post-attention epilogue: residual + norm2
             if layer.proj_bias is not None:

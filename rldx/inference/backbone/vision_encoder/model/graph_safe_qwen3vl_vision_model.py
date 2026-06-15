@@ -160,8 +160,13 @@ class GraphSafeQwen3VLVisionModel(nn.Module):
             self.max_seqlen = max(lengths)
             self.split_sizes = (grid_thw.prod(-1) // visual.spatial_merge_size**2).tolist()
 
-        # Wrap attention blocks
+        # Wrap attention blocks (idempotent). The backbone may be reused across
+        # multiple GraphSafe builds; re-wrapping an already-wrapped attn would make
+        # `sys.modules[type(attn).__module__]` resolve to THIS module (which has no
+        # apply_rotary_pos_emb_vision) instead of the original Qwen3VL module.
         for blk in visual.blocks:
+            if isinstance(blk.attn, GraphSafeQwen3VLVisionAttention):
+                continue
             blk.attn = GraphSafeQwen3VLVisionAttention(blk.attn, lengths, self.max_seqlen)
 
         # --- Motion-module setup ---

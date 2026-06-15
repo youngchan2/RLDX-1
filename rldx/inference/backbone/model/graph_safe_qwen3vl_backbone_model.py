@@ -37,7 +37,7 @@ class GraphSafeQwen3VLBackbone(nn.Module):
       qwen_linear:  nn.Module (projection)
     """
 
-    def __init__(self, backbone, vl_input, num_frames=1, num_views=1):
+    def __init__(self, backbone, vl_input, num_frames=1, num_views=1, pad_token_id=None):
         super().__init__()
 
         inner_model = backbone.qwen_model.model  # Qwen3VLModel
@@ -85,6 +85,20 @@ class GraphSafeQwen3VLBackbone(nn.Module):
         self.embed_tokens = self.gs_text._text_model.embed_tokens
         self.qwen_linear = backbone.qwen_linear
         self.image_token_id = inner_model.config.image_token_id
+        # Pad id used by ``update_input_ids`` to refill a shorter instruction
+        # up to the baked length. Falls back to Qwen ``<|endoftext|>`` (151643)
+        # when the config carries no explicit pad token.
+        _cfg_pad = getattr(inner_model.config, "pad_token_id", None)
+        self.pad_token_id = (
+            pad_token_id
+            if pad_token_id is not None
+            else (_cfg_pad if _cfg_pad is not None else 151643)
+        )
+        # Floor of the special-token id range (Qwen3: added/special tokens —
+        # image_pad, vision_start/end, im_start/end, <|endoftext|> — are all
+        # >= 151643; normal vocab is below). ``update_input_ids`` only lets
+        # normal-vocab (text) token VALUES change at the baked positions.
+        self.special_id_min = 151643
 
         # --- Static glue buffers ---
         B, L_ids = input_ids.shape
@@ -209,3 +223,68 @@ class GraphSafeQwen3VLBackbone(nn.Module):
 
         # Projection
         return self.qwen_linear(hidden_states)
+
+    # ------------------------------------------------------------------
+    # Runtime instruction refresh (graph-safe)
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def update_input_ids(self, new_input_ids, pad_token_id=None, allow_approx_pad=False):
+        """Refresh the baked instruction tokens for graph-safe reuse.
+
+        Writes ``new_input_ids`` into ``static_input_ids`` IN PLACE so a
+        captured CUDA graph / compiled kernel picks up the new instruction on
+        the next replay — ``forward`` reads ``self.static_input_ids`` for the
+        token-embedding gather, and an in-place ``copy_`` keeps the buffer
+        address the graph captured. Without this the model keeps serving the
+        instruction baked at build time.
+
+        ``image_mask_3d``, ``static_position_ids`` and the compression
+        ``begin/end`` indices are baked at build time and NOT recomputed here,
+        so they stay valid only when the new sequence preserves the positions
+        of every structural/image token. Two regimes:
+
+          * **Same length (exact).** Only normal-vocab (text) token values may
+            differ; every baked special token (image_pad, vision_start/end,
+            im_start/end, ...) must stay at its position with the same id, and
+            no new special may appear at a baked text position. Bit-exact vs
+            vanilla — verified at runtime.
+          * **Shorter (approximate, opt-in via ``allow_approx_pad``).** The
+            instruction is right-padded to the baked length. This is NOT
+            bit-exact: padded positions are attended under the mask-free varlen
+            path and trailing structural tokens shift in MROPE. Disabled by
+            default so the caller falls back to the exact eager path instead.
+
+        Longer-than-baked instructions are always rejected.
+
+        Returns:
+            bool: True if applied (graph stays valid); False if the caller
+                  should run the vanilla path instead.
+        """
+        B, L = self.static_input_ids.shape
+        ids = new_input_ids
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+        ids = ids.to(device=self.static_input_ids.device, dtype=self.static_input_ids.dtype)
+        if ids.shape[0] != B:
+            return False
+
+        if ids.shape[1] == L:
+            # Exact: structural/image tokens must match the baked layout, only
+            # text token values may change.
+            special = self.static_input_ids >= self.special_id_min
+            if not torch.equal(ids[special], self.static_input_ids[special]):
+                return False
+            if bool((ids[~special] >= self.special_id_min).any()):
+                return False
+        elif ids.shape[1] < L and allow_approx_pad:
+            pad = pad_token_id if pad_token_id is not None else self.pad_token_id
+            ids = torch.cat([ids, ids.new_full((B, L - ids.shape[1]), pad)], dim=1)
+            # Looser guard for the approximate path: image positions must align.
+            if not torch.equal(ids == self.image_token_id, self.image_mask_3d[:, :, 0]):
+                return False
+        else:
+            return False
+
+        self.static_input_ids.copy_(ids)
+        return True
