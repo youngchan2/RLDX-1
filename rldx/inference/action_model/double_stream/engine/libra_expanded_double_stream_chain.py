@@ -1,9 +1,9 @@
-"""Custom-op chain for ExpandedDoubleStreamBlock (3-way: VL|SA|P).
+"""Libra-op chain for ExpandedDoubleStreamBlock (3-way: VL|SA|P).
 
-ds::fused_attention_3way for RMSNorm + RoPE + Attention [VL|SA|P],
+ds::libra_fused_attention_3way for RMSNorm + RoPE + Attention [VL|SA|P],
 ds::vl_epilogue_ln for the VL residual + LayerNorm fusion.
 
-All-add-ons variant. For the no-add-ons counterpart (DoubleStreamBlock), see custom_double_stream_chain.py.
+All-add-ons variant. For the no-add-ons counterpart (DoubleStreamBlock), see libra_double_stream_chain.py.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 
 class LibraOpExpandedDoubleStreamBlock(nn.Module):
-    """Wraps ExpandedDoubleStreamBlock; ds::fused_attention_3way + ds::vl_epilogue_ln."""
+    """Wraps ExpandedDoubleStreamBlock; ds::libra_fused_attention_3way + ds::vl_epilogue_ln."""
 
     def __init__(self, block, n_sa, n_vl, n_p):
         super().__init__()
@@ -134,7 +134,7 @@ class LibraOpExpandedDoubleStreamBlock(nn.Module):
 
 
 class FullExpandedLibraOpDSChain(nn.Module):
-    """Chain of CustomOpExpandedDoubleStreamBlock (3-way) with cross-layer VL LN.
+    """Chain of LibraOpExpandedDoubleStreamBlock (3-way) with cross-layer VL LN.
 
     Args:
         blocks: list of ExpandedDoubleStreamBlock

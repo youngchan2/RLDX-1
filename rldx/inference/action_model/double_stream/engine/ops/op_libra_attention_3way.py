@@ -1,7 +1,7 @@
-"""Register ds::fused_attention_3way custom op.
+"""Register ds::libra_fused_attention_3way custom op.
 
-Triton kernel for RMSNorm + RoPE (3-way: VL|SA|P), then F.sdpa for joint attention.
-Extension of ds::fused_attention_2way for ExpandedDoubleStreamBlock.
+Triton kernel for RMSNorm + RoPE (3-way: VL|SA|P), then Libra FragTile CUDA kernel for joint attention.
+Extension of ds::libra_fused_attention_2way for ExpandedDoubleStreamBlock.
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def libra_fused_attention_3way(
     n_vl: int,
     n_p: int,
 ) -> torch.Tensor:
-    """RMSNorm + RoPE (Triton 3-way) + F.sdpa for ExpandedDoubleStreamBlock.
+    """RMSNorm + RoPE (Triton 3-way) + Libra FragTile attention for ExpandedDoubleStreamBlock.
 
     Args:
         sa_qkv: (n_sa, 3*inner_dim) bf16

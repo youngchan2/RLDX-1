@@ -1,8 +1,8 @@
-"""CustomOpExpandedMSAT: 3-way DS + SS custom ops (all add-ons).
+"""LibraOpExpandedMSAT: 3-way DS + SS Libra custom ops (all add-ons).
 
-Uses FullExpandedCustomOpDSChain + FullExpandedCustomOpSSChain with baked RoPE.
+Uses FullExpandedLibraOpDSChain + FullExpandedLibraOpSSChain with baked RoPE.
 temb/time_token are received from ActionModel chain (pre-baked at init).
-For the no-add-ons counterpart (without physics), see custom_msat_chain.py.
+For the no-add-ons counterpart (without physics), see libra_msat_chain.py.
 """
 
 from __future__ import annotations
@@ -17,7 +17,7 @@ from .custom_msat_chain import rope_cos_sin_from_embedder
 
 
 class LibraOpExpandedMSAT(nn.Module):
-    """MSAT with 3-way Triton custom ops (all add-ons, physics stream).
+    """MSAT with 3-way Libra custom ops (all add-ons, physics stream).
 
     temb and time_token are passed in (pre-baked by ActionModel chain).
     """

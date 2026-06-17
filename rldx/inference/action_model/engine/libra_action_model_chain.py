@@ -1,4 +1,4 @@
-"""CustomActionHeadChain: 2-way action head pipeline (no add-ons).
+"""LibraActionHeadChain: 2-way action head pipeline (no add-ons).
 
 Pre-bakes at init:
   - pos_embs:    position_embedding(static_pos_ids) — same every forward
@@ -7,7 +7,7 @@ Pre-bakes at init:
 
 Forward only runs data-dependent ops: action_enc, MSAT (DS+SS), action_dec, Euler.
 
-For the all-add-ons counterpart (with physics), see custom_expanded_action_model_chain.py.
+For the all-add-ons counterpart (with physics), see libra_expanded_action_model_chain.py.
 """
 
 from __future__ import annotations
@@ -172,14 +172,14 @@ class LibraActionHeadChain(nn.Module):
 
 
 def build_libra_action_model_chain(action_head_model, device, dtype=torch.bfloat16):
-    """Build a CustomActionHeadChain from a GraphSafeActionModel (no compilation)."""
+    """Build a LibraActionHeadChain from a GraphSafeActionModel (no compilation)."""
     return LibraActionHeadChain(action_head_model, device=device, dtype=dtype).eval()
 
 
 def compile_libra_action_model_chain(
     chain, sample_inputs, compile_mode="max-autotune", fullgraph=True
 ):
-    """Compile a CustomActionHeadChain with torch.compile and trigger compilation."""
+    """Compile a LibraActionHeadChain with torch.compile and trigger compilation."""
     import time as _time
 
     _print(f"  [ActionHeadChain] Compiling ({compile_mode}, fullgraph={fullgraph})...")

@@ -1,9 +1,9 @@
-"""CustomExpandedActionHeadChain: 3-way action head pipeline (all add-ons).
+"""LibraExpandedActionHeadChain: 3-way action head pipeline (all add-ons).
 
 Pre-bakes at init (same as 2-way):
   - pos_embs, tembs, time_tokens — all static across forwards
 
-For the no-add-ons counterpart (without physics), see custom_action_model_chain.py.
+For the no-add-ons counterpart (without physics), see libra_action_model_chain.py.
 """
 
 from __future__ import annotations
@@ -177,7 +177,7 @@ class LibraExpandedActionHeadChain(nn.Module):
             physics_fut_tok = self.physics_fut_encoder(physics_fut, t_scalar)
             physics_embs = torch.cat([physics_hist_tok, physics_fut_tok], dim=1)
 
-            # CustomOpExpandedMSAT
+            # LibraOpExpandedMSAT
             model_output = self.msat(
                 hidden_states=sa_embs,
                 encoder_hidden_states=vl_embs,
@@ -214,14 +214,14 @@ class LibraExpandedActionHeadChain(nn.Module):
 
 
 def build_libra_expanded_action_model_chain(action_head_model, device, dtype=torch.bfloat16):
-    """Build a CustomExpandedActionHeadChain from a GraphSafeActionModel (no compilation)."""
+    """Build a LibraExpandedActionHeadChain from a GraphSafeActionModel (no compilation)."""
     return LibraExpandedActionHeadChain(action_head_model, device=device, dtype=dtype).eval()
 
 
 def compile_libra_expanded_action_model_chain(
     chain, sample_inputs, compile_mode="max-autotune", fullgraph=True
 ):
-    """Compile a CustomExpandedActionHeadChain with torch.compile."""
+    """Compile a LibraExpandedActionHeadChain with torch.compile."""
     import time as _time
 
     _print(f"  [ExpandedActionHeadChain] Compiling ({compile_mode}, fullgraph={fullgraph})...")

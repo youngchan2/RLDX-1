@@ -1,9 +1,9 @@
-"""Custom-op chain for SingleStreamBlock (2-way: VL+SA).
+"""Libra-op chain for SingleStreamBlock (2-way: VL+SA).
 
-ss::fused_attention_2way + ss::fused_epilogue_ln.
+ss::libra_fused_attention_2way + ss::fused_epilogue_ln.
 
 No-add-ons variant. For the all-add-ons counterpart (ExpandedSingleStreamBlock), see
-custom_expanded_single_stream_chain.py.
+libra_expanded_single_stream_chain.py.
 """
 
 from __future__ import annotations
@@ -16,7 +16,7 @@ import torch.nn.functional as F
 
 
 class LibraOpSingleStreamBlock(nn.Module):
-    """Wraps SingleStreamBlock; ss::fused_attention_2way + epilogue."""
+    """Wraps SingleStreamBlock; ss::libra_fused_attention_2way + epilogue."""
 
     def __init__(self, block, n_tokens):
         super().__init__()
@@ -59,7 +59,7 @@ class LibraOpSingleStreamBlock(nn.Module):
 
 
 class FullLibraOpSSChain(nn.Module):
-    """Chain of CustomOpSingleStreamBlock (2-way) with cross-layer epilogue LN."""
+    """Chain of LibraOpSingleStreamBlock (2-way) with cross-layer epilogue LN."""
 
     def __init__(self, blocks, sa_rope_cos, sa_rope_sin, n_tokens, n_sa):
         super().__init__()

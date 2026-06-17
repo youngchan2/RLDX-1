@@ -1,6 +1,6 @@
-"""Register ds::fused_attention_2way custom op.
+"""Register ds::libra_fused_attention_2way custom op.
 
-Triton kernel for RMSNorm + RoPE, then F.sdpa for attention.
+Triton kernel for RMSNorm + RoPE, then Libra FragTile CUDA kernel for attention.
 """
 
 from __future__ import annotations
@@ -37,7 +37,7 @@ def libra_fused_attention(
     n_sa: int,
     n_vl: int,
 ) -> torch.Tensor:
-    """RMSNorm + RoPE (Triton) + F.sdpa for DoubleStreamBlock."""
+    """RMSNorm + RoPE (Triton) + Libra FragTile attention for DoubleStreamBlock."""
     from double_stream.engine.kernels.rmsnorm_rope_ds import rmsnorm_rope_kernel
 
     TOTAL = n_vl + n_sa

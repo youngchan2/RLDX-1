@@ -1,8 +1,8 @@
-"""CustomOpMSAT: 2-way DS + SS custom ops (no add-ons).
+"""LibraOpMSAT: 2-way DS + SS Libra custom ops (no add-ons).
 
-Uses FullCustomOpDSChain + FullCustomOpSSChain with baked RoPE cos/sin.
+Uses FullLibraOpDSChain + FullLibraOpSSChain with baked RoPE cos/sin.
 temb/time_token are received from ActionModel chain (pre-baked at init).
-For the all-add-ons counterpart (with physics), see custom_expanded_msat_chain.py.
+For the all-add-ons counterpart (with physics), see libra_expanded_msat_chain.py.
 """
 
 from __future__ import annotations
@@ -59,7 +59,7 @@ from single_stream.engine.libra_single_stream_chain import FullLibraOpSSChain  #
 
 
 class LibraOpMSAT(nn.Module):
-    """MSAT with 2-way Triton custom ops (no add-ons).
+    """MSAT with 2-way Libra custom ops (no add-ons).
 
     temb and time_token are passed in (pre-baked by ActionModel chain),
     not computed internally. Only DS/SS chains + output projection here.

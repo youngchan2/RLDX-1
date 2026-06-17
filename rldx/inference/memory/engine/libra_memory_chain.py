@@ -2,7 +2,7 @@
 
 Mirrors VLM's LibraLLMChain pattern, adapted for Memory:
   - Fused QKV GEMM (cuBLAS)
-  - mem::fused_attention (Triton: RoPE + block-causal SDPA)
+  - mem::libra_fused_attention (Libra FragTile CUDA: RoPE + block-causal attention)
   - mem::fused_epilogue_add2_rmsnorm (Triton: residual add + RMSNorm)
   - SwiGLU MLP (cuBLAS + torch.compile handles fusion)
 

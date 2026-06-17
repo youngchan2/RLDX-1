@@ -1,9 +1,9 @@
 """Vision Encoder chain for VLM.
 
-CustomVisionEncoderChain:
+LibraVisionEncoderChain:
   Chains N VisionBlocks + merger (+ deepstack mergers) into a single compilable nn.Module.
 
-  Attention: torch.ops.rldx_backbone.vision_attention — fused Triton kernel that reads
+  Attention: torch.ops.rldx_backbone.libra_vision_attention — fused Libra FragTile CUDA kernel that reads
   Q/K/V directly from the fused QKV buffer, applies baked RoPE in-register,
   and runs non-causal varlen attention with per-image boundaries from
   cu_seqlens. Single op replaces QKV reshape + Python RoPE + HF wrapper.
@@ -16,7 +16,7 @@ Qwen3VLVisionBlock structure (per block):
   - norm1: LayerNorm(D, bias=True)
   - attn:
       - qkv: Linear(D, 3*D, bias=True)    ← 1 fused QKV
-      - RoPE + non-causal attention: fused via torch.ops.rldx_backbone.vision_attention
+      - RoPE + non-causal attention: fused via torch.ops.rldx_backbone.libra_vision_attention
       - proj: Linear(D, D)                ← O projection
   - norm2: LayerNorm(D, bias=True)
   - mlp:
@@ -30,6 +30,8 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+
+from . import ops as _ops  # noqa: F401 — registers rldx_backbone:: vision ops (incl. libra)
 
 
 class VisionLayerParam(nn.Module):
@@ -60,7 +62,7 @@ class VisionLayerParam(nn.Module):
         self.scaling = attn.scaling
 
 
-class CustomVisionEncoderChain(nn.Module):
+class LibraVisionEncoderChain(nn.Module):
     """Wraps Qwen3VL VisionBlocks + merger into a single compilable chain.
 
     Attention uses baked RoPE + HF attention wrapper (torch.compile compatible).
@@ -202,7 +204,7 @@ class CustomVisionEncoderChain(nn.Module):
 
             # 3. Fused attention: baked RoPE + non-causal varlen attention
             #    Kernel reads Q/K/V directly from qkv (no permute/reshape copy).
-            attn_out = torch.ops.rldx_backbone.vision_attention(
+            attn_out = torch.ops.rldx_backbone.libra_vision_attention(
                 qkv,
                 self.rope_cos,
                 self.rope_sin,

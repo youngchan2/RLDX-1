@@ -1,8 +1,8 @@
-"""Custom-op chain for ExpandedSingleStreamBlock (3-way: [VL+SA | P]).
+"""Libra-op chain for ExpandedSingleStreamBlock (3-way: [VL+SA | P]).
 
-ss::fused_attention_3way + ss::fused_epilogue_ln (x stream only).
+ss::libra_fused_attention_3way + ss::fused_epilogue_ln (x stream only).
 
-All-add-ons variant. For the no-add-ons counterpart (SingleStreamBlock), see custom_single_stream_chain.py.
+All-add-ons variant. For the no-add-ons counterpart (SingleStreamBlock), see libra_single_stream_chain.py.
 """
 
 from __future__ import annotations
@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 
 class LibraOpExpandedSingleStreamBlock(nn.Module):
-    """Wraps ExpandedSingleStreamBlock; ss::fused_attention_3way + epilogue.
+    """Wraps ExpandedSingleStreamBlock; ss::libra_fused_attention_3way + epilogue.
 
     VL+SA: pre_norm → linear1 → split QKV|MLP → attention + SwiGLU → linear2
     P:     p_pre_norm → p_linear1 → split QKV|MLP → attention + SwiGLU → p_linear2
@@ -110,7 +110,7 @@ class LibraOpExpandedSingleStreamBlock(nn.Module):
 
 
 class FullExpandedLibraOpSSChain(nn.Module):
-    """Chain of CustomOpExpandedSingleStreamBlock (3-way) with cross-layer epilogue LN.
+    """Chain of LibraOpExpandedSingleStreamBlock (3-way) with cross-layer epilogue LN.
 
     Args:
         blocks: list of ExpandedSingleStreamBlock

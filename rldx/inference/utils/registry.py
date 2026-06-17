@@ -11,11 +11,23 @@ RLDX-1 deployment lineup:
 
 from __future__ import annotations
 
+from pathlib import Path
+
+
+# PT and MT-ALLEX ship their processor config under a ``processor/``
+# subfolder, but the loader reads ``processor_config.json`` straight from
+# the path root (no ``subfolder`` support). Point those entries at a
+# locally-materialised processor dir instead. Populate it once with:
+#   snapshot_download(repo, allow_patterns="processor/*",
+#                     local_dir=_PROC_CACHE / repo.split("/")[-1])
+# MT-DROID keeps its processor at the repo root, so it stays a HF path.
+_PROC_CACHE = Path(__file__).resolve().parents[3] / ".proc_cache"
+
 
 MODEL_REGISTRY = {
     "rldx_1_pretrain": {
         "hf_path": "RLWRLD/RLDX-1-PT",
-        "processor_path": "RLWRLD/RLDX-1-PT",
+        "processor_path": str(_PROC_CACHE / "RLDX-1-PT" / "processor"),
         # Backbone-only — the rest of the action-model plumbing is
         # initialised fresh by the loader.
         "load_mode": "extract_backbone",
@@ -27,7 +39,7 @@ MODEL_REGISTRY = {
     },
     "rldx_1_midtrain_allex": {
         "hf_path": "RLWRLD/RLDX-1-MT-ALLEX",
-        "processor_path": "RLWRLD/RLDX-1-MT-ALLEX",
+        "processor_path": str(_PROC_CACHE / "RLDX-1-MT-ALLEX" / "processor"),
         # Carries memory + torque physics weights — load the full model.
         "load_mode": "full",
         "default_args": {
