@@ -84,6 +84,15 @@ class CustomLLMChain(nn.Module):
         seq_len = pos_cos.shape[0]
         q_dim = self.layers[0].o_proj_weight.shape[1]
         hidden_dim = self.layers[0].qkv_weight.shape[1]
+
+        # Attention backend: False = fused Triton (QK-RMSNorm + RoPE + causal GQA),
+        # True = eager baked-RoPE + F.sdpa. Toggle on the instance (e.g. bench Path E).
+        self._use_sdpa = False
+        self.head_dim = self.layers[0].q_norm_w.shape[0]
+        self.num_heads = q_dim // self.head_dim
+        qkv_dim = self.layers[0].qkv_weight.shape[0]
+        self.num_kv_heads = (qkv_dim - q_dim) // 2 // self.head_dim
+
         self.register_buffer(
             "_deepstack_add",
             torch.zeros((1, seq_len, hidden_dim), dtype=pos_cos.dtype, device=pos_cos.device),
@@ -93,6 +102,40 @@ class CustomLLMChain(nn.Module):
                 "_attn_out",
                 torch.empty((seq_len, q_dim), dtype=pos_cos.dtype, device=pos_cos.device),
             )
+
+    def _sdpa_attention(self, qkv, q_norm_w, k_norm_w, cos, ssin):
+        """SDPA path matching ``fused_llm_attention``: per-head QK-RMSNorm (over
+        head_dim, eps=1e-6) -> norm weight -> RoPE (q*cos + swap_half(q)*signed_sin)
+        -> causal GQA F.scaled_dot_product_attention. ``signed_sin`` has the
+        rotate_half sign baked in; applying the weight before swap_half reproduces
+        the kernel's rotated-weight cross term. scale = head_dim**-0.5.
+        """
+        M = qkv.shape[0]
+        H, Hkv, hd = self.num_heads, self.num_kv_heads, self.head_dim
+        QD, KD = H * hd, Hkv * hd
+        half = hd // 2
+        eps = 1e-6
+
+        q = qkv[:, :QD].reshape(M, H, hd).float()
+        k = qkv[:, QD : QD + KD].reshape(M, Hkv, hd).float()
+        v = qkv[:, QD + KD : QD + 2 * KD].reshape(M, Hkv, hd)
+
+        q = q * torch.rsqrt(q.pow(2).mean(-1, keepdim=True) + eps) * q_norm_w.float()
+        k = k * torch.rsqrt(k.pow(2).mean(-1, keepdim=True) + eps) * k_norm_w.float()
+
+        cos_ = cos.view(M, 1, hd)
+        sin_ = ssin.view(M, 1, hd)
+        q = (q * cos_ + torch.cat((q[..., half:], q[..., :half]), dim=-1) * sin_).to(v.dtype)
+        k = (k * cos_ + torch.cat((k[..., half:], k[..., :half]), dim=-1) * sin_).to(v.dtype)
+
+        # (M, H, D) -> (1, H, M, D); GQA broadcast via enable_gqa
+        q = q.reshape(1, M, H, hd).transpose(1, 2)
+        k = k.reshape(1, M, Hkv, hd).transpose(1, 2)
+        v = v.reshape(1, M, Hkv, hd).transpose(1, 2)
+        out = F.scaled_dot_product_attention(
+            q, k, v, is_causal=True, scale=hd ** -0.5, enable_gqa=True
+        )
+        return out.transpose(1, 2).reshape(M, QD)  # (M, Q_DIM)
 
     def forward(self, hidden_states, deepstack_features=None, deepstack_flat_indices=None):
         cos = self.cos
@@ -109,17 +152,20 @@ class CustomLLMChain(nn.Module):
             B, M, D = normed.shape
             qkv = F.linear(normed.view(M, D), layer.qkv_weight)  # (M, QKV_DIM)
 
-            # 3. Fused attention → custom op (QK RMSNorm + RoPE + Causal Attention)
-            attn_out = fused_llm_attention_forward(
-                qkv,
-                layer.q_norm_w,
-                layer.q_norm_w_rot,
-                layer.k_norm_w,
-                layer.k_norm_w_rot,
-                cos,
-                ssin,
-                out=layer._attn_out,
-            )  # (M, Q_DIM)
+            # 3. Attention — fused Triton (QK-RMSNorm + RoPE + causal GQA) OR eager RoPE + F.sdpa
+            if self._use_sdpa:
+                attn_out = self._sdpa_attention(qkv, layer.q_norm_w, layer.k_norm_w, cos, ssin)
+            else:
+                attn_out = fused_llm_attention_forward(
+                    qkv,
+                    layer.q_norm_w,
+                    layer.q_norm_w_rot,
+                    layer.k_norm_w,
+                    layer.k_norm_w_rot,
+                    cos,
+                    ssin,
+                    out=layer._attn_out,
+                )  # (M, Q_DIM)
 
             # 4. O projection
             attn_out = F.linear(attn_out, layer.o_proj_weight).view(B, M, -1)

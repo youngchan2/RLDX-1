@@ -8,6 +8,8 @@ Benchmark paths (always run in order):
   B: Torch Inductor (vanilla)          — torch.compile on vanilla LLM layers (compiler only)
   C: GraphSafe + CUDA Graph            — GraphSafe wrapping + CUDA Graph capture
   D: Custom Chain                      — GraphSafe + custom Triton kernels + torch.compile
+  E: Custom Chain (SDPA attn)          — Custom chain but attention (vision + LLM) = eager RoPE + F.sdpa, + torch.compile
+  F: GraphSafe + compile               — full graph-safe backbone + torch.compile (NO custom ops; compiler only)
 
 Usage:
   python inference/backbone/benchmark_backbone.py
@@ -264,6 +266,72 @@ def main():
         torch._dynamo.reset()
     except Exception as e:
         print(f"  [CustomVLMChain] Failed: {e}")
+        traceback.print_exc()
+
+    # =========================================================================
+    # Path E: CustomVLMChain (attention = SDPA) + torch.compile
+    # =========================================================================
+    # Same custom chain as Path D, but BOTH vision and LLM attention sub-ops are
+    # swapped to eager baked-RoPE + F.scaled_dot_product_attention (cuDNN/FA).
+    print(f"\n{'=' * 60}")
+    print("Path E: CustomVLMChain (SDPA attn) + torch.compile")
+    print(f"{'=' * 60}")
+    try:
+        from engine.custom_backbone_chain import (
+            build_custom_backbone_chain,
+            compile_custom_backbone_chain,
+        )
+
+        pv = vl_input["pixel_values"]
+        if pv.ndim == 3:
+            pv = pv.reshape(-1, pv.shape[-1])
+        pv = pv.type(gs_backbone.gs_visual.dtype)
+
+        print("  Building CustomVLMChain (SDPA attention)...")
+        sdpa_chain = build_custom_backbone_chain(gs_backbone)
+        sdpa_chain.set_use_sdpa(True)  # vision + LLM attention -> F.sdpa
+        compiled_sdpa, t_e = compile_custom_backbone_chain(sdpa_chain, pv)
+        build_times["E: SDPA attn"] = t_e
+
+        def sdpa_fn():
+            with torch.no_grad():
+                return compiled_sdpa(pv)
+
+        run_benchmark("E: CustomVLMChain (sdpa)", sdpa_fn)
+        torch._dynamo.reset()
+    except Exception as e:
+        print(f"  [CustomVLMChain sdpa] Failed: {e}")
+        traceback.print_exc()
+
+    # =========================================================================
+    # Path F: GraphSafe backbone + torch.compile (NO custom ops)
+    # =========================================================================
+    # The graph-safe backbone forward (patched at the Path C build) run under
+    # torch.compile — the all-PyTorch, compiler-only counterpart to the custom
+    # chains (D/E). No custom Triton kernels anywhere.
+    print(f"\n{'=' * 60}")
+    print("Path F: GraphSafe + torch.compile (no custom ops)")
+    print(f"{'=' * 60}")
+    try:
+        torch._dynamo.reset()
+        compiled_backbone = torch.compile(backbone, mode=args.compile_mode)
+
+        print(f"  Compiling (mode={args.compile_mode})...")
+        t0 = _time.time()
+        with torch.no_grad():
+            compiled_backbone(vl_input)
+        torch.cuda.synchronize()
+        build_times["F: GraphSafe+compile"] = _time.time() - t0
+        print(f"  Compilation: {build_times['F: GraphSafe+compile']:.1f}s")
+
+        def gs_compile_fn():
+            with torch.no_grad():
+                return compiled_backbone(vl_input)["backbone_features"]
+
+        run_benchmark("F: GraphSafe + compile", gs_compile_fn)
+        torch._dynamo.reset()
+    except Exception as e:
+        print(f"  [GraphSafe + compile] Failed: {e}")
         traceback.print_exc()
 
     # =========================================================================

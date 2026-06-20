@@ -80,6 +80,7 @@ class CustomVLMChain(nn.Module):
         self.llm_chain = llm_chain
         self.pre_compress_chain = pre_compress_chain
         self.post_compress_chain = post_compress_chain
+        self._sub_chains = [vision_chain, llm_chain, pre_compress_chain, post_compress_chain]
 
         # Vision / LLM modules (not owned, just referenced)
         self.patch_embed = patch_embed
@@ -155,6 +156,17 @@ class CustomVLMChain(nn.Module):
     # ------------------------------------------------------------------
     # Forward
     # ------------------------------------------------------------------
+
+    def set_use_sdpa(self, flag: bool):
+        """Toggle the SDPA attention backend on every sub-chain (vision + LLM).
+
+        When True, both the vision chain and the LLM chain(s) swap their fused
+        Triton attention for eager baked-RoPE + F.scaled_dot_product_attention.
+        No-op on sub-chains that are None (e.g. unused compress chains).
+        """
+        for ch in self._sub_chains:
+            if ch is not None:
+                ch._use_sdpa = flag
 
     def forward(self, pixel_values):
         """Full VLM forward: vision → embed → LLM → projection.

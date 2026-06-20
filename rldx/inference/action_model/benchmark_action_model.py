@@ -6,6 +6,8 @@ Benchmark paths (always run in order):
   B: Torch Inductor (vanilla)          — torch.compile on vanilla MSAT (compiler only)
   C: GraphSafe + CUDA Graph            — GraphSafe wrapping + CUDA Graph capture
   D: Custom Chain                      — GraphSafe + custom Triton kernels + torch.compile
+  E: Libra Chain                       — GraphSafe + Libra/FragTile attention + torch.compile
+  F: GraphSafe + compile               — GraphSafe model + torch.compile (NO custom ops; compiler only)
 
 Usage:
   python inference/action_model/benchmark_action_model.py                                  # RLDX-1 without add-ons
@@ -515,6 +517,66 @@ def main():
     except Exception as e:
         print(f"  [LibraChain] Failed: {e}")
         traceback.print_exc()
+
+    # =========================================================================
+    # Path F: GraphSafe + torch.compile (NO custom ops)
+    # =========================================================================
+    # Same graph-safe action model as Path C (pure PyTorch, no custom Triton
+    # chain), but accelerated with torch.compile instead of CUDA-graph capture —
+    # the all-PyTorch counterpart to the custom chains (D/E). A fresh instance is
+    # built so Path C's CUDA-graph-captured model is not reused.
+    print(f"\n{'=' * 60}")
+    print("Path F: GraphSafe + torch.compile (no custom ops)")
+    print(f"{'=' * 60}")
+    try:
+        print("  Building GraphSafeActionModel...")
+        physics_override = args.physics_hist_len is not None or args.physics_fut_len is not None
+        if physics_override and n_physics > 0:
+            gs_action_model_compile = GraphSafeActionModel(
+                action_model=components["action_model"],
+                n_vl=N_vl,
+                n_sa_pure=N_sa,
+                action_horizon=action_horizon,
+                action_dim=dims["action_dim"],
+                num_inference_timesteps=denoising_steps,
+                device=device,
+                dtype=dtype,
+                physics_cond_encoder=components.get("physics_cond_encoder"),
+                physics_fut_encoder=components.get("physics_fut_encoder"),
+                physics_decoder=components.get("physics_decoder"),
+                physics_hist_len=physics_hist_len,
+                physics_fut_len=physics_fut_len,
+                physics_dim=physics_dim,
+            ).eval()
+        else:
+            gs_action_model_compile = GraphSafeActionModel(
+                action_model=components["action_model"],
+                n_vl=N_vl,
+                n_sa_pure=N_sa,
+                action_horizon=action_horizon,
+                action_dim=dims["action_dim"],
+                num_inference_timesteps=denoising_steps,
+                device=device,
+                dtype=dtype,
+            ).eval()
+
+        torch._dynamo.reset()
+        compiled_gs = torch.compile(gs_action_model_compile, mode=args.compile_mode)
+
+        print(f"  Compiling (mode={args.compile_mode})...")
+        t0 = _time.time()
+        with torch.no_grad():
+            make_gs_fn(compiled_gs)()
+        torch.cuda.synchronize()
+        build_times["F: GraphSafe+compile"] = _time.time() - t0
+        print(f"  Compilation: {build_times['F: GraphSafe+compile']:.1f}s")
+
+        run_benchmark("F: GraphSafe + compile", make_gs_fn(compiled_gs))
+        torch._dynamo.reset()
+    except Exception as e:
+        print(f"  [GraphSafe + compile] Failed: {e}")
+        traceback.print_exc()
+
     # =========================================================================
     # Report
     # =========================================================================

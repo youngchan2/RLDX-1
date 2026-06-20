@@ -12,6 +12,9 @@ Benchmark paths (always run in order):
   B: Torch Inductor (vanilla)          — torch.compile on vanilla module (compiler only)
   C: GraphSafe + CUDA Graph            — GraphSafe wrapping + CUDA Graph capture
   D: Custom Chain                      — GraphSafe + custom Triton kernels + torch.compile
+  E: Libra Chain                       — GraphSafe + Libra/FragTile attention + torch.compile
+  F: SDPA Chain                        — Custom chain but attention = eager RoPE + F.sdpa, + torch.compile
+  G: GraphSafe + compile               — Path C's graph-safe model + torch.compile (NO custom ops; compiler only)
 
 Usage:
   python inference/memory/benchmark_memory.py
@@ -263,6 +266,75 @@ def main():
         run_benchmark("E: LibraMemoryChain", make_fn(compiled_chain))
     except Exception as e:
         print(f"  [MemoryChain] Failed: {e}")
+        traceback.print_exc()
+
+    # =========================================================================
+    # Path F: CustomMemoryChain (SDPA attention) + torch.compile
+    # =========================================================================
+    # Same chain as Path D (custom Triton GEMMs/epilogues), but the attention
+    # sub-op is swapped to eager baked-RoPE + F.scaled_dot_product_attention.
+    print(f"\n{'=' * 60}")
+    print("Path F: CustomMemoryChain (SDPA attn) + torch.compile")
+    print(f"{'=' * 60}")
+    try:
+        if "gs_memory" not in locals():
+            gs_memory = GraphSafeMemory(
+                memory_module=memory_module,
+                memory_length=K,
+                memory_n_cog_tokens=n_cog_mem,
+                device=device,
+                dtype=dtype,
+            ).eval()
+
+        print("  Building CustomMemoryChain (SDPA attention)...")
+        sdpa_chain = build_custom_memory_chain(gs_memory, device=device, dtype=dtype)
+        sdpa_chain._use_sdpa = True  # swap only the attention sub-op for F.sdpa
+
+        compiled_chain, chain_compile_time = compile_custom_memory_chain(
+            sdpa_chain, inputs_embeds, compile_mode=args.compile_mode
+        )
+        build_times["F: SDPA"] = chain_compile_time
+
+        run_benchmark("F: SDPA Chain", make_fn(compiled_chain))
+    except Exception as e:
+        print(f"  [SDPA Chain] Failed: {e}")
+        traceback.print_exc()
+
+    # =========================================================================
+    # Path G: GraphSafe + torch.compile (NO custom ops)
+    # =========================================================================
+    # Same graph-safe model as Path C (pure PyTorch, no custom Triton kernels),
+    # but accelerated with torch.compile instead of CUDA-graph capture. Isolates
+    # what the compiler ALONE achieves on the graph-safe model — the all-PyTorch
+    # counterpart to the custom-kernel chains (D/E/F). A fresh GraphSafeMemory is
+    # built so Path C's CUDA-graph-captured instance is not reused.
+    print(f"\n{'=' * 60}")
+    print("Path G: GraphSafe + torch.compile (no custom ops)")
+    print(f"{'=' * 60}")
+    try:
+        gs_memory_compile = GraphSafeMemory(
+            memory_module=memory_module,
+            memory_length=K,
+            memory_n_cog_tokens=n_cog_mem,
+            device=device,
+            dtype=dtype,
+        ).eval()
+
+        torch._dynamo.reset()
+        compiled_gs = torch.compile(gs_memory_compile, mode=args.compile_mode)
+
+        print("  Triggering compilation...")
+        t0 = _time.time()
+        with torch.no_grad():
+            compiled_gs(inputs_embeds)
+        torch.cuda.synchronize()
+        build_times["G: GraphSafe+compile"] = _time.time() - t0
+        print(f"  Compilation: {build_times['G: GraphSafe+compile']:.1f}s")
+
+        run_benchmark("G: GraphSafe + compile", make_fn(compiled_gs))
+        torch._dynamo.reset()
+    except Exception as e:
+        print(f"  [GraphSafe + compile] Failed: {e}")
         traceback.print_exc()
 
     # =========================================================================
