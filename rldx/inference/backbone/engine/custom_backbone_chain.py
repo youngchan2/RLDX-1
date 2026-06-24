@@ -66,6 +66,12 @@ class CustomVLMChain(nn.Module):
         # cog-token
         n_cog_tokens=0,
         static_cog_emb=None,  # (n_cog, D) bf16 — learned cog-token embeddings
+        # Post-LLM slice mode: ``"cog_only"`` / ``"meta_only"`` keep only
+        # the last ``n_cog_tokens`` rows; anything else (notably ``"full"``)
+        # keeps the full LLM output. Must match the
+        # ``GraphSafeQwen3VLBackbone`` slice contract — otherwise Path D
+        # feeds a token count that does not match the baked MSAT layout.
+        cog_mode: str = "cog_only",
         # Context compression
         compress_begin_idx=-1,  # Python int — start of image region (-1 = no compression)
         compress_end_idx=-1,  # Python int — end of image region
@@ -80,7 +86,6 @@ class CustomVLMChain(nn.Module):
         self.llm_chain = llm_chain
         self.pre_compress_chain = pre_compress_chain
         self.post_compress_chain = post_compress_chain
-        self._sub_chains = [vision_chain, llm_chain, pre_compress_chain, post_compress_chain]
 
         # Vision / LLM modules (not owned, just referenced)
         self.patch_embed = patch_embed
@@ -101,6 +106,7 @@ class CustomVLMChain(nn.Module):
 
         # cog-token
         self.n_cog_tokens = n_cog_tokens
+        self.cog_mode = cog_mode
         if static_cog_emb is not None:
             self.register_buffer("static_cog_emb", static_cog_emb)
         else:
@@ -157,17 +163,6 @@ class CustomVLMChain(nn.Module):
     # Forward
     # ------------------------------------------------------------------
 
-    def set_use_sdpa(self, flag: bool):
-        """Toggle the SDPA attention backend on every sub-chain (vision + LLM).
-
-        When True, both the vision chain and the LLM chain(s) swap their fused
-        Triton attention for eager baked-RoPE + F.scaled_dot_product_attention.
-        No-op on sub-chains that are None (e.g. unused compress chains).
-        """
-        for ch in self._sub_chains:
-            if ch is not None:
-                ch._use_sdpa = flag
-
     def forward(self, pixel_values):
         """Full VLM forward: vision → embed → LLM → projection.
 
@@ -213,8 +208,9 @@ class CustomVLMChain(nn.Module):
             out = self._static_compress(out)
             out = self.post_compress_chain(out)
 
-        # cog-token Extract (optional)
-        if self.n_cog_tokens > 0:
+        # cog-token Extract — only collapse to the cog tail under the
+        # cog-only modes (mirrors gs_backbone / vanilla slice contract).
+        if self.n_cog_tokens > 0 and self.cog_mode in ("cog_only", "meta_only"):
             out = out[:, -self.n_cog_tokens :, :]
 
         # Projection
@@ -346,7 +342,7 @@ class CustomVLMChain(nn.Module):
         refs["llm_intermediates"] = llm_intermediates
 
         # cog-token Extract
-        if self.n_cog_tokens > 0:
+        if self.n_cog_tokens > 0 and self.cog_mode in ("cog_only", "meta_only"):
             llm_out = llm_out[:, -self.n_cog_tokens :, :]
 
         # Projection
@@ -617,6 +613,7 @@ def build_custom_backbone_chain(vlm_model, device=None, dtype=torch.bfloat16):
         image_mask_3d=vlm_model.image_mask_3d,
         n_cog_tokens=n_cog_tokens,
         static_cog_emb=static_cog_emb,
+        cog_mode=getattr(vlm_model, "cog_mode", "cog_only"),
         compress_begin_idx=compress_begin_idx,
         compress_end_idx=compress_end_idx,
         image_token_id=getattr(vlm_model, "image_token_id", None),

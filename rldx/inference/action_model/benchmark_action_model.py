@@ -6,8 +6,7 @@ Benchmark paths (always run in order):
   B: Torch Inductor (vanilla)          — torch.compile on vanilla MSAT (compiler only)
   C: GraphSafe + CUDA Graph            — GraphSafe wrapping + CUDA Graph capture
   D: Custom Chain                      — GraphSafe + custom Triton kernels + torch.compile
-  E: Libra Chain                       — GraphSafe + Libra/FragTile attention + torch.compile
-  F: GraphSafe + compile               — GraphSafe model + torch.compile (NO custom ops; compiler only)
+  E: GraphSafe + compile               — GraphSafe model + torch.compile (NO custom ops; compiler only)
 
 Usage:
   python inference/action_model/benchmark_action_model.py                                  # RLDX-1 without add-ons
@@ -459,74 +458,14 @@ def main():
         traceback.print_exc()
 
     # =========================================================================
-    # Path E: LibraActionHeadChain + torch.compile
-    # =========================================================================
-    print(f"\n{'=' * 60}")
-    print("Path E: LibraActionHeadChain + torch.compile")
-    print(f"{'=' * 60}")
-    try:
-        if "gs_action_model" not in locals():
-            gs_action_model = GraphSafeActionModel(
-                action_model=components["action_model"],
-                n_vl=N_vl,
-                n_sa_pure=N_sa,
-                action_horizon=action_horizon,
-                action_dim=dims["action_dim"],
-                num_inference_timesteps=denoising_steps,
-                device=device,
-                dtype=dtype,
-            ).eval()
-
-        if n_physics > 0:
-            from engine.libra_expanded_action_model_chain import LibraExpandedActionHeadChain
-
-            print("  Building LibraExpandedActionHeadChain (3-way)...")
-            libra_ah = LibraExpandedActionHeadChain(
-                gs_action_model, device=device, dtype=dtype
-            ).eval()
-        else:
-            from engine.libra_action_model_chain import LibraActionHeadChain
-
-            print("  Building LibraActionHeadChain (2-way)...")
-            libra_ah = LibraActionHeadChain(gs_action_model, device=device, dtype=dtype).eval()
-
-        print(f"  Compiling (mode={args.compile_mode})...")
-        compiled_ah = torch.compile(libra_ah, mode=args.compile_mode)
-
-        t0 = _time.time()
-        with torch.no_grad():
-            for i in range(5):
-                if n_physics > 0:
-                    compiled_ah(
-                        vl_embs,
-                        state,
-                        embodiment_id,
-                        init_noise=init_noise,
-                        physics_hist=physics_hist,
-                        physics_init_noise=physics_init_noise,
-                    )
-                else:
-                    compiled_ah(vl_embs, state, embodiment_id, init_noise=init_noise)
-                if i == 0:
-                    print("    Compilation warmup 1/5 done")
-        torch.cuda.synchronize()
-        build_times["E: LibraChain"] = _time.time() - t0
-        print(f"    Compilation complete ({build_times['E: LibraChain']:.1f}s)")
-
-        run_benchmark("E: LibraActionHeadChain", make_gs_fn(compiled_ah))
-    except Exception as e:
-        print(f"  [LibraChain] Failed: {e}")
-        traceback.print_exc()
-
-    # =========================================================================
-    # Path F: GraphSafe + torch.compile (NO custom ops)
+    # Path E: GraphSafe + torch.compile (NO custom ops)
     # =========================================================================
     # Same graph-safe action model as Path C (pure PyTorch, no custom Triton
     # chain), but accelerated with torch.compile instead of CUDA-graph capture —
-    # the all-PyTorch counterpart to the custom chains (D/E). A fresh instance is
+    # the all-PyTorch counterpart to the custom chain (D). A fresh instance is
     # built so Path C's CUDA-graph-captured model is not reused.
     print(f"\n{'=' * 60}")
-    print("Path F: GraphSafe + torch.compile (no custom ops)")
+    print("Path E: GraphSafe + torch.compile (no custom ops)")
     print(f"{'=' * 60}")
     try:
         print("  Building GraphSafeActionModel...")
@@ -568,10 +507,10 @@ def main():
         with torch.no_grad():
             make_gs_fn(compiled_gs)()
         torch.cuda.synchronize()
-        build_times["F: GraphSafe+compile"] = _time.time() - t0
-        print(f"  Compilation: {build_times['F: GraphSafe+compile']:.1f}s")
+        build_times["E: GraphSafe+compile"] = _time.time() - t0
+        print(f"  Compilation: {build_times['E: GraphSafe+compile']:.1f}s")
 
-        run_benchmark("F: GraphSafe + compile", make_gs_fn(compiled_gs))
+        run_benchmark("E: GraphSafe + compile", make_gs_fn(compiled_gs))
         torch._dynamo.reset()
     except Exception as e:
         print(f"  [GraphSafe + compile] Failed: {e}")

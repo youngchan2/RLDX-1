@@ -12,7 +12,6 @@ Benchmark paths (always run in order):
   B: Torch Inductor (vanilla)          — torch.compile on vanilla module (compiler only)
   C: GraphSafe + CUDA Graph            — GraphSafe wrapping + CUDA Graph capture
   D: Custom Chain                      — GraphSafe + custom Triton kernels + torch.compile
-  E: Libra Chain                       — GraphSafe + Libra/FragTile attention + torch.compile
   F: SDPA Chain                        — Custom chain but attention = eager RoPE + F.sdpa, + torch.compile
   G: GraphSafe + compile               — Path C's graph-safe model + torch.compile (NO custom ops; compiler only)
 
@@ -43,9 +42,7 @@ _path.setup(__file__)
 # Imports
 from engine import (  # noqa: E402
     build_custom_memory_chain,
-    build_libra_memory_chain, 
     compile_custom_memory_chain,
-    compile_libra_memory_chain,
     setup_cuda_graph,
 )
 
@@ -238,43 +235,14 @@ def main():
     except Exception as e:
         print(f"  [MemoryChain] Failed: {e}")
         traceback.print_exc()
-    
-    # =========================================================================
-    # Path E: LibraMemoryChain + torch.compile
-    # =========================================================================
-    print(f"\n{'=' * 60}")
-    print("Path E: LibraMemoryChain + torch.compile")
-    print(f"{'=' * 60}")
-    try:
-        if "gs_memory" not in locals():
-            gs_memory = GraphSafeMemory(
-                memory_module=memory_module,
-                memory_length=K,
-                memory_n_cog_tokens=n_cog_mem,
-                device=device,
-                dtype=dtype,
-            ).eval()
-
-        print("  Building LibraMemoryChain...")
-        libra_chain = build_libra_memory_chain(gs_memory, device=device, dtype=dtype)
-
-        compiled_chain, chain_compile_time = compile_libra_memory_chain(
-            libra_chain, inputs_embeds, compile_mode=args.compile_mode
-        )
-        build_times["E: MemoryChain"] = chain_compile_time
-
-        run_benchmark("E: LibraMemoryChain", make_fn(compiled_chain))
-    except Exception as e:
-        print(f"  [MemoryChain] Failed: {e}")
-        traceback.print_exc()
 
     # =========================================================================
-    # Path F: CustomMemoryChain (SDPA attention) + torch.compile
+    # Path E: CustomMemoryChain (SDPA attention) + torch.compile
     # =========================================================================
     # Same chain as Path D (custom Triton GEMMs/epilogues), but the attention
     # sub-op is swapped to eager baked-RoPE + F.scaled_dot_product_attention.
     print(f"\n{'=' * 60}")
-    print("Path F: CustomMemoryChain (SDPA attn) + torch.compile")
+    print("Path E: CustomMemoryChain (SDPA attn) + torch.compile")
     print(f"{'=' * 60}")
     try:
         if "gs_memory" not in locals():

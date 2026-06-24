@@ -43,6 +43,10 @@ class CustomExpandedActionHeadChain(nn.Module):
         self.physics_hist_len = gs_action_model.physics_hist_len
         self.physics_fut_len = gs_action_model.physics_fut_len
         self.physics_dim = gs_action_model.physics_dim
+        # Mirror the substrate's hist-feeding contract — ``gs_msat.n_physics``
+        # was baked from the same flag, so the chain must concat physics
+        # tokens at the same length.
+        self.feed_physics_hist = getattr(gs_action_model, "feed_physics_hist", False)
 
         # --- Bake static values ---
         msat_raw = gs_action_model.gs_msat._msat
@@ -127,8 +131,17 @@ class CustomExpandedActionHeadChain(nn.Module):
             )
             prefix_features = prefix_features + self.static_pos_embs[:, :d]
 
-        # Physics setup
-        if self.physics_hist_len > 0:
+        # Physics setup — branch must agree with the baked ``n_physics``
+        # (see ``feed_physics_hist`` on ``__init__``).
+        if self.feed_physics_hist:
+            if physics_hist is None:
+                physics_hist = torch.zeros(
+                    B,
+                    self.physics_hist_len,
+                    self.physics_dim,
+                    dtype=vl_embs.dtype,
+                    device=vl_embs.device,
+                )
             physics_hist_tok = self.physics_cond_encoder(physics_hist)
         else:
             physics_hist_tok = torch.zeros(

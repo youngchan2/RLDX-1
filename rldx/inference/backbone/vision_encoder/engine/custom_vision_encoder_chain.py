@@ -35,7 +35,6 @@ import torch.nn.functional as F
 
 from utils.device_caps import is_server_class
 
-
 class VisionLayerParam(nn.Module):
     """Per-block weight container for Qwen3VL VisionBlock.
 
@@ -120,14 +119,6 @@ class CustomVisionEncoderChain(nn.Module):
         self.register_buffer("cu_seqlens", cu_seqlens)
         self.max_seqlen = max_seqlen
 
-        # Attention backend selection (resolved at build, before compile/capture —
-        # graph-safe). On server-grade GPUs (A100 sm_80 / H100 sm_90) the custom
-        # 5090-era Triton flash kernel is ~5-12x SLOWER than cuDNN/FlashAttention
-        # routed via F.sdpa (head_dim=72 pads to BLOCK_D=128 and tl.dot can't match
-        # WGMMA/TMA). So prefer the RoPE+sdpa path there and let torch.compile fuse
-        # RoPE + dispatch FA-3 (H100) / FA-2 (A100). Consumer Blackwell (sm_120),
-        # where cuDNN-FA is unavailable, keeps the custom kernel.
-        #   RLDX_VISION_ATTN = auto (default) | sdpa | custom
         _mode = os.environ.get("RLDX_VISION_ATTN", "auto").lower()
         if _mode == "sdpa":
             self._use_sdpa = True
@@ -140,7 +131,7 @@ class CustomVisionEncoderChain(nn.Module):
         # kernel's own seq_len = M // num_seqs assumption).
         self._num_seqs = int(cu_seqlens.numel() - 1)
 
-        # Motion (all add-ons): inserted after motion_insert_layer
+        # Motion (v1.4-all): inserted after motion_insert_layer
         # MotionBlock expects (B*V*T*P, D) with grid_sizes=(B*V, 3)
         # Vision encoder hidden_states are (B*T*V*P, D) — need T↔V permute
         self.motion_block = motion_block
@@ -293,7 +284,7 @@ class CustomVisionEncoderChain(nn.Module):
             else:
                 hidden_states = hidden_states + mlp_out
 
-            # Motion insertion (all add-ons): after motion_insert_layer
+            # Motion insertion (v1.4-all): after motion_insert_layer
             # hidden_states is (B*T*V*P, D) but MotionBlock expects (B*V*T*P, D)
             # Includes raster↔interleaved patch order conversion (n1.6-0407)
             if self.motion_block is not None and i == self.motion_insert_layer:

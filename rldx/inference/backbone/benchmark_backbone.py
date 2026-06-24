@@ -7,8 +7,8 @@ Benchmark paths (always run in order):
   A: Vanilla                           — Original PyTorch model, eager execution (baseline)
   B: Torch Inductor (vanilla)          — torch.compile on vanilla LLM layers (compiler only)
   C: GraphSafe + CUDA Graph            — GraphSafe wrapping + CUDA Graph capture
-  D: Custom Chain                      — GraphSafe + custom Triton kernels + torch.compile
-  E: Custom Chain (SDPA attn)          — Custom chain but attention (vision + LLM) = eager RoPE + F.sdpa, + torch.compile
+  D: Custom Chain (all custom)         — GraphSafe + custom Triton kernels everywhere (vision + LLM) + torch.compile
+  E: Custom Chain (vision SDPA)        — vision attention = eager RoPE + F.sdpa; LLM attention = custom Triton; + torch.compile
   F: GraphSafe + compile               — full graph-safe backbone + torch.compile (NO custom ops; compiler only)
 
 Usage:
@@ -107,6 +107,22 @@ def parse_args():
 
 
 # Main
+
+
+def _set_chain_sdpa(chain, *, vision: bool, llm: bool) -> None:
+    """Per-component attention backend toggle on a CustomVLMChain.
+
+    ``vision`` / ``llm`` = True  -> that component's attention uses eager
+    baked-RoPE + F.scaled_dot_product_attention; False -> custom Triton kernel.
+
+    Set this BEFORE ``compile_custom_backbone_chain`` (torch.compile specializes
+    on the bool at trace time). Handles the compression case where the LLM is
+    split into pre/post chains (``llm_chain`` is None then).
+    """
+    chain.vision_chain._use_sdpa = vision
+    for c in (chain.llm_chain, chain.pre_compress_chain, chain.post_compress_chain):
+        if c is not None:
+            c._use_sdpa = llm
 
 
 def main():
@@ -253,8 +269,12 @@ def main():
             pv = pv.reshape(-1, pv.shape[-1])
         pv = pv.type(gs_backbone.gs_visual.dtype)
 
-        print("  Building CustomVLMChain...")
+        print("  Building CustomVLMChain (all custom kernels)...")
         backbone_chain = build_custom_backbone_chain(gs_backbone)
+        # Path D = ALL custom kernels. Force vision custom too — auto mode picks
+        # F.sdpa for vision on server-class GPUs (A100/H100), which would make
+        # this identical to Path E.
+        _set_chain_sdpa(backbone_chain, vision=False, llm=False)
         compiled_chain, chain_compile_time = compile_custom_backbone_chain(backbone_chain, pv)
         build_times["D: CustomVLM"] = chain_compile_time
 
@@ -274,7 +294,7 @@ def main():
     # Same custom chain as Path D, but BOTH vision and LLM attention sub-ops are
     # swapped to eager baked-RoPE + F.scaled_dot_product_attention (cuDNN/FA).
     print(f"\n{'=' * 60}")
-    print("Path E: CustomVLMChain (SDPA attn) + torch.compile")
+    print("Path E: CustomVLMChain (vision SDPA, LLM custom) + torch.compile")
     print(f"{'=' * 60}")
     try:
         from engine.custom_backbone_chain import (
@@ -287,9 +307,10 @@ def main():
             pv = pv.reshape(-1, pv.shape[-1])
         pv = pv.type(gs_backbone.gs_visual.dtype)
 
-        print("  Building CustomVLMChain (SDPA attention)...")
+        print("  Building CustomVLMChain (vision SDPA, LLM custom)...")
         sdpa_chain = build_custom_backbone_chain(gs_backbone)
-        sdpa_chain.set_use_sdpa(True)  # vision + LLM attention -> F.sdpa
+        # Path E = vision attention via F.sdpa; LLM attention stays custom Triton.
+        _set_chain_sdpa(sdpa_chain, vision=True, llm=False)
         compiled_sdpa, t_e = compile_custom_backbone_chain(sdpa_chain, pv)
         build_times["E: SDPA attn"] = t_e
 
@@ -297,7 +318,7 @@ def main():
             with torch.no_grad():
                 return compiled_sdpa(pv)
 
-        run_benchmark("E: CustomVLMChain (sdpa)", sdpa_fn)
+        run_benchmark("E: vision-SDPA + LLM-custom", sdpa_fn)
         torch._dynamo.reset()
     except Exception as e:
         print(f"  [CustomVLMChain sdpa] Failed: {e}")

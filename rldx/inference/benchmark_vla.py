@@ -561,9 +561,24 @@ def main():
         )
         build_times["D: CustomVLA"] = compile_time
 
-        # 4. Benchmark — reuse the same pv tensor (CUDA graph expects same address)
+        # 4. Benchmark — reuse the same pv tensor (CUDA graph expects the same
+        # address) and call with the EXACT kwargs used at compile time. Dynamo
+        # guards on call-site signature / tensor-vs-``None`` identity, so
+        # omitting a kwarg the compile call passed as a tensor (e.g.
+        # ``physics_init_noise`` for physics models) misses the cached graph and
+        # trips an illegal memory access on recapture.
         def custom_vla_fn(vl_in, st, emb, init_noise=None, physics_init_noise=None):
-            return compiled_vla(pv, st, emb, init_noise=init_noise)
+            if use_physics:
+                return compiled_vla(
+                    pv,
+                    st,
+                    emb,
+                    init_noise=init_noise,
+                    physics_hist=None,
+                    physics_init_noise=physics_init_noise,
+                    prefix_actions=None,
+                )
+            return compiled_vla(pv, st, emb, init_noise=init_noise, prefix_actions=None)
 
         run_benchmark("D: CustomVLAChain", make_fn(custom_vla_fn))
 

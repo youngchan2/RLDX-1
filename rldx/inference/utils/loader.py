@@ -93,10 +93,14 @@ def load_backbone(args):
     torch.cuda.set_device(args.device)
     device = torch.device(f"cuda:{args.device}")
 
-    if model_cfg.get("load_mode") == "extract_backbone":
+    # Full checkpoints (pretrain "extract_backbone" / midtrain "full") have no
+    # ``backbone_cls`` to construct from — load the full RLDX model and extract
+    # the backbone. Only backbone-only checkpoints (vtc) take the else branch.
+    if "backbone_cls" not in model_cfg:
         full_model, device = _load_full_model(args.model_type, model_path, device=args.device)
         backbone = full_model.backbone
-        del full_model.action_model
+        if hasattr(full_model, "action_model"):
+            del full_model.action_model
         del full_model
         gc.collect()
         torch.cuda.empty_cache()

@@ -12,6 +12,10 @@ acceleration differ:
   C: GraphSafe + CUDA Graph      — graph-safe text model + manual CUDA-graph capture.
   D: CustomLLMChain + compile    — custom Triton fused attention (QK-RMSNorm + RoPE +
                                    causal) + fused residual/RMSNorm epilogues, + torch.compile.
+  E: CustomLLMChain(SDPA)+compile— SAME chain/epilogues as D, but attention runs as
+                                   eager baked-RoPE + F.scaled_dot_product_attention
+                                   (enable_gqa=True) instead of the fused Triton kernel.
+                                   Isolates the attention-backend cost (D vs E).
   F: GraphSafe + compile         — graph-safe text model + torch.compile, NO custom ops
                                    (the all-PyTorch / compiler-only counterpart to D).
 
@@ -19,7 +23,8 @@ Notes:
   - No "B: Inductor on raw vanilla": the graph-safe eager model IS the faithful
     vanilla here (running the raw HF text model standalone needs hand-assembled
     position_embeddings + FA varlen kwargs).
-  - No "E: Libra chain": there is no LibraLLMChain for the LLM in this repo.
+  - Paths D & E share one CustomLLMChain instance (same weights); only the
+    ``_use_sdpa`` toggle differs, so their latency delta is purely attention backend.
   - Input is synthetic randn(B, L, D); all paths receive the SAME tensor, so the
     latency and cross-path cos-sim are both meaningful. L / D / position_ids come
     from the real GraphSafe backbone (3D MROPE), not invented.
@@ -225,11 +230,12 @@ def main():
         traceback.print_exc()
 
     # =========================================================================
-    # Path D: CustomLLMChain (fused Triton attention) + torch.compile
+    # Shared build for Paths D & E: RoPE buffers + one CustomLLMChain instance.
+    # Both paths run identical weights/epilogues; only the ``_use_sdpa`` toggle
+    # (fused Triton kernel vs F.sdpa) differs, so their latency delta is purely
+    # the attention backend. Building once avoids duplicating chain weights.
     # =========================================================================
-    print(f"\n{'=' * 60}")
-    print("Path D: CustomLLMChain + torch.compile")
-    print(f"{'=' * 60}")
+    llm_chain = None
     try:
         dummy_embeds = torch.empty(B, L, D, device=device, dtype=dtype)
         with torch.no_grad():
@@ -241,29 +247,75 @@ def main():
         pos_cos = pos_cos.contiguous()
         signed_sin = prepare_signed_sin(pos_sin.contiguous(), head_dim)
 
-        print("  Building CustomLLMChain...")
+        print("\n  Building CustomLLMChain (shared by Paths D & E)...")
         llm_chain = CustomLLMChain(list(gs_text.layers), gs_text.norm, pos_cos, signed_sin).eval()
-
-        torch._dynamo.reset()
-        compiled_chain = torch.compile(llm_chain, mode=args.compile_mode)
-
-        def custom_fn():
-            with torch.no_grad():
-                return compiled_chain(inputs_embeds)
-
-        print(f"  Compiling (mode={args.compile_mode})...")
-        t0 = _time.time()
-        with torch.no_grad():
-            compiled_chain(inputs_embeds)
-        torch.cuda.synchronize()
-        build_times["D: CustomLLMChain"] = _time.time() - t0
-        print(f"  Compilation: {build_times['D: CustomLLMChain']:.1f}s")
-
-        run_benchmark("D: CustomLLMChain", custom_fn)
-        torch._dynamo.reset()
     except Exception as e:
-        print(f"  [CustomLLMChain] Failed: {e}")
+        print(f"  [CustomLLMChain build] Failed: {e}")
         traceback.print_exc()
+
+    # =========================================================================
+    # Path D: CustomLLMChain (fused Triton attention) + torch.compile
+    # =========================================================================
+    print(f"\n{'=' * 60}")
+    print("Path D: CustomLLMChain (fused Triton) + torch.compile")
+    print(f"{'=' * 60}")
+    if llm_chain is not None:
+        try:
+            llm_chain._use_sdpa = False  # fused Triton attention
+            torch._dynamo.reset()
+            compiled_chain = torch.compile(llm_chain, mode=args.compile_mode)
+
+            def custom_fn():
+                with torch.no_grad():
+                    return compiled_chain(inputs_embeds)
+
+            print(f"  Compiling (mode={args.compile_mode})...")
+            t0 = _time.time()
+            with torch.no_grad():
+                compiled_chain(inputs_embeds)
+            torch.cuda.synchronize()
+            build_times["D: CustomLLMChain"] = _time.time() - t0
+            print(f"  Compilation: {build_times['D: CustomLLMChain']:.1f}s")
+
+            run_benchmark("D: CustomLLMChain", custom_fn)
+            torch._dynamo.reset()
+        except Exception as e:
+            print(f"  [CustomLLMChain] Failed: {e}")
+            traceback.print_exc()
+
+    # =========================================================================
+    # Path E: CustomLLMChain (SDPA attention, enable_gqa) + torch.compile
+    # =========================================================================
+    # Same chain instance as D with ``_use_sdpa=True``: attention becomes eager
+    # baked-RoPE + F.scaled_dot_product_attention(enable_gqa=True). A fresh
+    # torch.compile re-traces against the toggled branch (dynamo guards on the flag).
+    print(f"\n{'=' * 60}")
+    print("Path E: CustomLLMChain (SDPA, enable_gqa) + torch.compile")
+    print(f"{'=' * 60}")
+    if llm_chain is not None:
+        try:
+            llm_chain._use_sdpa = True  # eager RoPE + F.sdpa (GQA broadcast)
+            torch._dynamo.reset()
+            compiled_chain_sdpa = torch.compile(llm_chain, mode=args.compile_mode)
+
+            def sdpa_fn():
+                with torch.no_grad():
+                    return compiled_chain_sdpa(inputs_embeds)
+
+            print(f"  Compiling (mode={args.compile_mode})...")
+            t0 = _time.time()
+            with torch.no_grad():
+                compiled_chain_sdpa(inputs_embeds)
+            torch.cuda.synchronize()
+            build_times["E: CustomLLMChain(SDPA)"] = _time.time() - t0
+            print(f"  Compilation: {build_times['E: CustomLLMChain(SDPA)']:.1f}s")
+
+            run_benchmark("E: CustomLLMChain(SDPA)", sdpa_fn)
+            torch._dynamo.reset()
+            llm_chain._use_sdpa = False  # restore default
+        except Exception as e:
+            print(f"  [CustomLLMChain SDPA] Failed: {e}")
+            traceback.print_exc()
 
     # =========================================================================
     # Path F: GraphSafe + torch.compile (NO custom ops)

@@ -127,7 +127,15 @@ def _extract_memory_config(full_model: Any) -> tuple[Any | None, dict[str, Any] 
         full_model, "_memory_module", None
     )
     if memory_module is None:
-        return None, None
+        # ``use_memory=True`` but the module is absent. Silently returning
+        # ``(None, None)`` would build a memory-less Path C/D chain — i.e.
+        # serve an "all" (midtrain) model as a "v" (pretrain) model. Fail loud.
+        raise RuntimeError(
+            "config.use_memory=True but the model exposes neither a ``memory`` "
+            "nor ``_memory_module`` attribute. Refusing to silently build a "
+            "memory-less optimized chain (which would degrade an 'all' model to "
+            "'v' behaviour). Ensure the policy was loaded with its memory module."
+        )
 
     n_cog = getattr(cfg, "n_cog_tokens", 64)
     mem_n_cog = getattr(cfg, "memory_n_cog_tokens", None) or n_cog
@@ -194,8 +202,12 @@ def _build_graph_safe_vla_from_real_inputs(
             device=device,
             dtype=dtype,
         ).eval()
+        # ``n_vl`` must match the memory-module output, not the raw
+        # backbone length: ``cog_mode="full"`` makes ``n_vl_raw`` the
+        # unsliced LLM output, so adding ``n_cog_mem`` would over-count.
+        n_q = memory_config["n_cog_tokens"]
         n_cog_mem = memory_config["memory_n_cog_tokens"]
-        n_vl = n_vl_raw + n_cog_mem if memory_config["concat_memory"] else n_vl_raw
+        n_vl = (n_q + n_cog_mem) if memory_config["concat_memory"] else n_q
     else:
         n_vl = n_vl_raw
 
@@ -214,38 +226,16 @@ def _build_graph_safe_vla_from_real_inputs(
         device=device,
         dtype=dtype,
         prefix_len=prefix_len,
+        # The dispatcher does not pipe ``physics_hist`` to Path C/D
+        # (see ``_first_time_build``); keep this False so the static
+        # MSAT bakes ``n_physics = physics_fut_len``.
+        feed_physics_hist=False,
     ).eval()
 
     gs_vla = GraphSafeVLA(
         gs_backbone, gs_action_model, gs_memory=gs_memory, memory_config=memory_config
     ).eval()
     return gs_vla, n_state, action_horizon
-
-
-def _flatten_collated(collated_inputs: dict) -> dict:
-    """Mirror ``RLDX.get_action``'s flatten: unwrap nested ``inputs`` and merge
-    top-level kwargs (e.g. ``action_prefix``, ``rtc_prefix_len``) into one dict.
-    Without this, RTC-injected top-level keys leave modality keys nested under
-    ``"inputs"`` and downstream lookups (``backbone_inputs["pixel_values"]``)
-    raise KeyError. Matches the eager path's ``inputs is None`` tolerance and
-    its loud-fail on collision (see ``RLDX.get_action``).
-    """
-    inner = collated_inputs.get("inputs")
-    if inner is None:
-        return {k: v for k, v in collated_inputs.items() if k != "inputs"}
-    if not isinstance(inner, dict):
-        raise TypeError(
-            f"_flatten_collated: 'inputs' must be a dict (got {type(inner).__name__}); "
-            "PolicyRuntime always wraps modality dicts under 'inputs'."
-        )
-    extras = {k: v for k, v in collated_inputs.items() if k != "inputs"}
-    collision = set(inner).intersection(extras)
-    if collision:
-        raise ValueError(
-            "_flatten_collated: keys collide between nested 'inputs' and top-level "
-            f"kwargs: {sorted(collision)}. Pass each key in exactly one place."
-        )
-    return {**inner, **extras}
 
 
 class _CompiledDispatcher:
@@ -303,7 +293,10 @@ class _CompiledDispatcher:
 
         # PolicyRuntime calls ``get_action(**collated)`` — when it wraps the
         # modality dict under ``inputs`` we unwrap it here.
-        real_inputs = _flatten_collated(collated_inputs)
+        if "inputs" in collated_inputs and len(collated_inputs) == 1:
+            real_inputs = dict(collated_inputs["inputs"])
+        else:
+            real_inputs = dict(collated_inputs)
         backbone_inputs, action_inputs = self.full_model.prepare_input(real_inputs)
 
         bi = dict(backbone_inputs)
@@ -456,7 +449,10 @@ class _CompiledDispatcher:
             return first_result
 
         try:
-            real_inputs = _flatten_collated(collated_inputs)
+            if "inputs" in collated_inputs and len(collated_inputs) == 1:
+                real_inputs = dict(collated_inputs["inputs"])
+            else:
+                real_inputs = dict(collated_inputs)
             backbone_inputs, action_inputs = self.full_model.prepare_input(real_inputs)
             pv = backbone_inputs["pixel_values"]
             if pv.ndim == 3:
@@ -557,14 +553,10 @@ def _apply_path_cd(policy, path: str, compile_mode: str, bake_prefix_len: int = 
     The wrapper sits outside the model — ``RLDX`` itself is unchanged, and
     the captured graph is the same forward the dispatcher otherwise runs.
     """
-    full_model = _find_full_model(policy)
-    cfg = getattr(full_model, "config", None)
-    action_horizon = int(getattr(cfg, "action_horizon", 16)) if cfg is not None else 16
     dispatcher = _CompiledDispatcher(
         policy,
         path=path,
         compile_mode=compile_mode,
-        action_horizon=action_horizon,
         bake_prefix_len=bake_prefix_len,
     )
     dispatcher.full_model.get_action = dispatcher  # type: ignore[assignment]
@@ -612,12 +604,6 @@ def apply_optimization(policy, path: str = "A", compile_mode: str = "max-autotun
     bake_prefix_len = _resolve_rtc_for_bake(full_model, path)
     cfg = getattr(full_model, "config", None)
     rtc_mode = getattr(cfg, "rtc_inference_mode", "none") if cfg is not None else "none"
-    if rtc_mode == "guided":
-        raise ValueError(
-            f"path={path!r} cannot serve rtc_inference_mode='guided' — the compiled "
-            "fullgraph cannot route VJP through ``action_prefix``. Use rtc_inference_mode "
-            "in {'none', 'trained'} for paths C/D, or fall back to path A/B."
-        )
     if rtc_mode == "trained" and bake_prefix_len == 0:
         _print(
             "[serve_optimization] WARNING: rtc_inference_mode='trained' but "

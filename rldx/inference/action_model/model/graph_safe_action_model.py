@@ -70,6 +70,11 @@ class GraphSafeActionModel(nn.Module):
         # ``forward(prefix_actions=...)`` must supply the frozen
         # prefix tensor of shape ``(B, prefix_len, action_dim)``.
         prefix_len: int = 0,
+        # Whether ``forward()`` will receive a real ``physics_hist`` tensor.
+        # When False (default) the runtime concat emits a length-0 hist
+        # placeholder, so the static MSAT bakes ``n_physics = physics_fut_len``;
+        # when True it bakes ``n_physics = physics_hist_len + physics_fut_len``.
+        feed_physics_hist: bool = False,
     ):
         super().__init__()
 
@@ -107,7 +112,11 @@ class GraphSafeActionModel(nn.Module):
             use_physics = True
 
         self.use_physics = use_physics
-        n_physics = physics_hist_len + physics_fut_len if use_physics else 0
+        # Bake ``n_physics`` to the runtime ``hist_tok | fut_tok`` length
+        # so the DS / SS RoPE precompute matches the actual concat.
+        self.feed_physics_hist = bool(use_physics and feed_physics_hist)
+        runtime_hist_len = physics_hist_len if self.feed_physics_hist else 0
+        n_physics = (runtime_hist_len + physics_fut_len) if use_physics else 0
 
         # --- GraphSafeMSAT (shared by all engine paths) ---
         self.gs_msat = GraphSafeMSAT(msat, n_vl, n_sa_pure, device, n_physics=n_physics)
@@ -162,7 +171,7 @@ class GraphSafeActionModel(nn.Module):
             _print(
                 f"  [GraphSafeActionModel] physics: dim={physics_dim}, "
                 f"hist_len={physics_hist_len}, fut_len={physics_fut_len}, "
-                f"n_physics={n_physics}"
+                f"n_physics={n_physics}, feed_physics_hist={self.feed_physics_hist}"
             )
         if self.prefix_len > 0:
             _print(f"  [GraphSafeActionModel] RTC trained: prefix_len={self.prefix_len}")
@@ -222,8 +231,17 @@ class GraphSafeActionModel(nn.Module):
         physics_hist_tok = None
         physics_fut = None
         if self.use_physics:
-            # Encode history (once, before loop)
-            if physics_hist is not None and self.physics_hist_len > 0:
+            # Encode history (once, before loop). Branch must match the
+            # baked ``n_physics`` (see ``feed_physics_hist`` on __init__).
+            if self.feed_physics_hist:
+                if physics_hist is None:
+                    physics_hist = torch.zeros(
+                        B,
+                        self.physics_hist_len,
+                        self.physics_dim,
+                        dtype=vl_embs.dtype,
+                        device=vl_embs.device,
+                    )
                 physics_hist_tok = self.physics_cond_encoder(physics_hist)
             else:
                 physics_hist_tok = torch.zeros(

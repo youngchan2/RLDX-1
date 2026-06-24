@@ -84,62 +84,76 @@ def rmsnorm_rope_kernel_3way(
     q_col = h * D
     k_col = N + h * D
     v_col = 2 * N + h * D
-    mask_v = (rs[:, None] < M) & (rd[None, :] < D)
+    s_mask = rs < M
+    d_mask = rd < D
+    mask_v = s_mask[:, None] & d_mask[None, :]
 
     # --- Region classification ---
     is_vl = rs < N_VL
     is_sa = (rs >= N_VL) & (rs < N_VL + N_SA)
     is_p = rs >= N_VL + N_SA
-    vl_idx = rs
-    sa_idx = tl.where(is_sa, rs - N_VL, 0)
-    p_idx = tl.where(is_p, rs - N_VL - N_SA, 0)
+    # Triton's mask= argument gates the load *result* but not the address
+    # computation: every lane still emits its (ptr + offset) memory
+    # transaction.  On Blackwell (sm_120 / Triton 3.6) an OOB address from a
+    # masked-out lane raises cudaErrorIllegalAddress instead of being
+    # silently dropped, so each per-region index must stay within its
+    # buffer.  ``sa_idx`` / ``p_idx`` already clamp to 0 via tl.where; the
+    # original ``vl_idx = rs`` did not, so SA/P-region lanes walked off the
+    # VL_QKV buffer end whenever N_VL < BLOCK_S * cdiv(M, BLOCK_S).
+    # ``rs_safe`` / ``rd_safe`` give the same guarantee for the (rs, rd)
+    # axes used by the post-Phase-1 stores and the SA/P RoPE blocks.
+    vl_idx = tl.where(is_vl & s_mask, rs, 0)
+    sa_idx = tl.where(is_sa & s_mask, rs - N_VL, 0)
+    p_idx = tl.where(is_p & s_mask, rs - N_VL - N_SA, 0)
+    rs_safe = tl.where(s_mask, rs, M - 1)
+    rd_safe = tl.where(d_mask, rd, D - 1)
 
     # --- Phase 1: Load QKV from 3 separate buffers ---
     Q_vl = tl.load(
-        VL_QKV_ptr + vl_idx[:, None] * VL_QKV_stride0 + (q_col + rd)[None, :] * VL_QKV_stride1,
-        mask=is_vl[:, None] & (rd[None, :] < D),
+        VL_QKV_ptr + vl_idx[:, None] * VL_QKV_stride0 + (q_col + rd_safe)[None, :] * VL_QKV_stride1,
+        mask=is_vl[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
     K_vl = tl.load(
-        VL_QKV_ptr + vl_idx[:, None] * VL_QKV_stride0 + (k_col + rd)[None, :] * VL_QKV_stride1,
-        mask=is_vl[:, None] & (rd[None, :] < D),
+        VL_QKV_ptr + vl_idx[:, None] * VL_QKV_stride0 + (k_col + rd_safe)[None, :] * VL_QKV_stride1,
+        mask=is_vl[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
     V_vl = tl.load(
-        VL_QKV_ptr + vl_idx[:, None] * VL_QKV_stride0 + (v_col + rd)[None, :] * VL_QKV_stride1,
-        mask=is_vl[:, None] & (rd[None, :] < D),
+        VL_QKV_ptr + vl_idx[:, None] * VL_QKV_stride0 + (v_col + rd_safe)[None, :] * VL_QKV_stride1,
+        mask=is_vl[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
     Q_sa = tl.load(
-        SA_QKV_ptr + sa_idx[:, None] * SA_QKV_stride0 + (q_col + rd)[None, :] * SA_QKV_stride1,
-        mask=is_sa[:, None] & (rd[None, :] < D),
+        SA_QKV_ptr + sa_idx[:, None] * SA_QKV_stride0 + (q_col + rd_safe)[None, :] * SA_QKV_stride1,
+        mask=is_sa[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
     K_sa = tl.load(
-        SA_QKV_ptr + sa_idx[:, None] * SA_QKV_stride0 + (k_col + rd)[None, :] * SA_QKV_stride1,
-        mask=is_sa[:, None] & (rd[None, :] < D),
+        SA_QKV_ptr + sa_idx[:, None] * SA_QKV_stride0 + (k_col + rd_safe)[None, :] * SA_QKV_stride1,
+        mask=is_sa[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
     V_sa = tl.load(
-        SA_QKV_ptr + sa_idx[:, None] * SA_QKV_stride0 + (v_col + rd)[None, :] * SA_QKV_stride1,
-        mask=is_sa[:, None] & (rd[None, :] < D),
+        SA_QKV_ptr + sa_idx[:, None] * SA_QKV_stride0 + (v_col + rd_safe)[None, :] * SA_QKV_stride1,
+        mask=is_sa[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
     Q_p = tl.load(
-        P_QKV_ptr + p_idx[:, None] * P_QKV_stride0 + (q_col + rd)[None, :] * P_QKV_stride1,
-        mask=is_p[:, None] & (rd[None, :] < D),
+        P_QKV_ptr + p_idx[:, None] * P_QKV_stride0 + (q_col + rd_safe)[None, :] * P_QKV_stride1,
+        mask=is_p[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
     K_p = tl.load(
-        P_QKV_ptr + p_idx[:, None] * P_QKV_stride0 + (k_col + rd)[None, :] * P_QKV_stride1,
-        mask=is_p[:, None] & (rd[None, :] < D),
+        P_QKV_ptr + p_idx[:, None] * P_QKV_stride0 + (k_col + rd_safe)[None, :] * P_QKV_stride1,
+        mask=is_p[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
     V_p = tl.load(
-        P_QKV_ptr + p_idx[:, None] * P_QKV_stride0 + (v_col + rd)[None, :] * P_QKV_stride1,
-        mask=is_p[:, None] & (rd[None, :] < D),
+        P_QKV_ptr + p_idx[:, None] * P_QKV_stride0 + (v_col + rd_safe)[None, :] * P_QKV_stride1,
+        mask=is_p[:, None] & d_mask[None, :],
         other=0.0,
     ).to(tl.float32)
 
@@ -150,7 +164,10 @@ def rmsnorm_rope_kernel_3way(
 
     # --- Phase 2: Store V (directly to bf16) ---
     tl.store(
-        V_out_ptr + h * V_out_stride0 + rs[:, None] * V_out_stride1 + rd[None, :] * V_out_stride2,
+        V_out_ptr
+        + h * V_out_stride0
+        + rs_safe[:, None] * V_out_stride1
+        + rd_safe[None, :] * V_out_stride2,
         V1.to(tl.bfloat16),
         mask=mask_v,
     )
@@ -187,12 +204,18 @@ def rmsnorm_rope_kernel_3way(
 
     # Store un-RoPE'd Q/K
     tl.store(
-        Q_out_ptr + h * Q_out_stride0 + rs[:, None] * Q_out_stride1 + rd[None, :] * Q_out_stride2,
+        Q_out_ptr
+        + h * Q_out_stride0
+        + rs_safe[:, None] * Q_out_stride1
+        + rd_safe[None, :] * Q_out_stride2,
         Q_norm,
         mask=mask_v,
     )
     tl.store(
-        K_out_ptr + h * K_out_stride0 + rs[:, None] * K_out_stride1 + rd[None, :] * K_out_stride2,
+        K_out_ptr
+        + h * K_out_stride0
+        + rs_safe[:, None] * K_out_stride1
+        + rd_safe[None, :] * K_out_stride2,
         K_norm_val,
         mask=mask_v,
     )
@@ -205,7 +228,7 @@ def rmsnorm_rope_kernel_3way(
     any_sa = (s + BLOCK_S > sa_start) & (s < sa_end)
 
     if any_sa:
-        sa_rope_idx = tl.where(is_sa_rope, rs - sa_start, 0)
+        sa_rope_idx = tl.where(is_sa_rope & s_mask, rs - sa_start, 0)
         rd2 = tl.arange(0, D // 2)
         re = 2 * rd2
         ro = re + 1
@@ -229,7 +252,7 @@ def rmsnorm_rope_kernel_3way(
         q_e = tl.load(
             Q_out_ptr
             + h * Q_out_stride0
-            + rs[:, None] * Q_out_stride1
+            + rs_safe[:, None] * Q_out_stride1
             + re[None, :] * Q_out_stride2,
             mask=mask_sa_rope,
             other=0.0,
@@ -237,7 +260,7 @@ def rmsnorm_rope_kernel_3way(
         q_o = tl.load(
             Q_out_ptr
             + h * Q_out_stride0
-            + rs[:, None] * Q_out_stride1
+            + rs_safe[:, None] * Q_out_stride1
             + ro[None, :] * Q_out_stride2,
             mask=mask_sa_rope,
             other=0.0,
@@ -245,7 +268,7 @@ def rmsnorm_rope_kernel_3way(
         k_e = tl.load(
             K_out_ptr
             + h * K_out_stride0
-            + rs[:, None] * K_out_stride1
+            + rs_safe[:, None] * K_out_stride1
             + re[None, :] * K_out_stride2,
             mask=mask_sa_rope,
             other=0.0,
@@ -253,7 +276,7 @@ def rmsnorm_rope_kernel_3way(
         k_o = tl.load(
             K_out_ptr
             + h * K_out_stride0
-            + rs[:, None] * K_out_stride1
+            + rs_safe[:, None] * K_out_stride1
             + ro[None, :] * K_out_stride2,
             mask=mask_sa_rope,
             other=0.0,
@@ -262,7 +285,7 @@ def rmsnorm_rope_kernel_3way(
         tl.store(
             Q_out_ptr
             + h * Q_out_stride0
-            + rs[:, None] * Q_out_stride1
+            + rs_safe[:, None] * Q_out_stride1
             + re[None, :] * Q_out_stride2,
             (q_e * cos_sa - q_o * sin_sa).to(tl.bfloat16),
             mask=mask_sa_rope,
@@ -270,7 +293,7 @@ def rmsnorm_rope_kernel_3way(
         tl.store(
             Q_out_ptr
             + h * Q_out_stride0
-            + rs[:, None] * Q_out_stride1
+            + rs_safe[:, None] * Q_out_stride1
             + ro[None, :] * Q_out_stride2,
             (q_e * sin_sa + q_o * cos_sa).to(tl.bfloat16),
             mask=mask_sa_rope,
@@ -278,7 +301,7 @@ def rmsnorm_rope_kernel_3way(
         tl.store(
             K_out_ptr
             + h * K_out_stride0
-            + rs[:, None] * K_out_stride1
+            + rs_safe[:, None] * K_out_stride1
             + re[None, :] * K_out_stride2,
             (k_e * cos_sa - k_o * sin_sa).to(tl.bfloat16),
             mask=mask_sa_rope,
@@ -286,7 +309,7 @@ def rmsnorm_rope_kernel_3way(
         tl.store(
             K_out_ptr
             + h * K_out_stride0
-            + rs[:, None] * K_out_stride1
+            + rs_safe[:, None] * K_out_stride1
             + ro[None, :] * K_out_stride2,
             (k_e * sin_sa + k_o * cos_sa).to(tl.bfloat16),
             mask=mask_sa_rope,
@@ -298,7 +321,7 @@ def rmsnorm_rope_kernel_3way(
     any_p = s + BLOCK_S > p_start
 
     if any_p:
-        p_rope_idx = tl.where(is_p_rope, rs - p_start, 0)
+        p_rope_idx = tl.where(is_p_rope & s_mask, rs - p_start, 0)
         rd2 = tl.arange(0, D // 2)
         re = 2 * rd2
         ro = re + 1
@@ -322,7 +345,7 @@ def rmsnorm_rope_kernel_3way(
         q_e = tl.load(
             Q_out_ptr
             + h * Q_out_stride0
-            + rs[:, None] * Q_out_stride1
+            + rs_safe[:, None] * Q_out_stride1
             + re[None, :] * Q_out_stride2,
             mask=mask_p_rope,
             other=0.0,
@@ -330,7 +353,7 @@ def rmsnorm_rope_kernel_3way(
         q_o = tl.load(
             Q_out_ptr
             + h * Q_out_stride0
-            + rs[:, None] * Q_out_stride1
+            + rs_safe[:, None] * Q_out_stride1
             + ro[None, :] * Q_out_stride2,
             mask=mask_p_rope,
             other=0.0,
@@ -338,7 +361,7 @@ def rmsnorm_rope_kernel_3way(
         k_e = tl.load(
             K_out_ptr
             + h * K_out_stride0
-            + rs[:, None] * K_out_stride1
+            + rs_safe[:, None] * K_out_stride1
             + re[None, :] * K_out_stride2,
             mask=mask_p_rope,
             other=0.0,
@@ -346,7 +369,7 @@ def rmsnorm_rope_kernel_3way(
         k_o = tl.load(
             K_out_ptr
             + h * K_out_stride0
-            + rs[:, None] * K_out_stride1
+            + rs_safe[:, None] * K_out_stride1
             + ro[None, :] * K_out_stride2,
             mask=mask_p_rope,
             other=0.0,
@@ -355,7 +378,7 @@ def rmsnorm_rope_kernel_3way(
         tl.store(
             Q_out_ptr
             + h * Q_out_stride0
-            + rs[:, None] * Q_out_stride1
+            + rs_safe[:, None] * Q_out_stride1
             + re[None, :] * Q_out_stride2,
             (q_e * cos_p - q_o * sin_p).to(tl.bfloat16),
             mask=mask_p_rope,
@@ -363,7 +386,7 @@ def rmsnorm_rope_kernel_3way(
         tl.store(
             Q_out_ptr
             + h * Q_out_stride0
-            + rs[:, None] * Q_out_stride1
+            + rs_safe[:, None] * Q_out_stride1
             + ro[None, :] * Q_out_stride2,
             (q_e * sin_p + q_o * cos_p).to(tl.bfloat16),
             mask=mask_p_rope,
@@ -371,7 +394,7 @@ def rmsnorm_rope_kernel_3way(
         tl.store(
             K_out_ptr
             + h * K_out_stride0
-            + rs[:, None] * K_out_stride1
+            + rs_safe[:, None] * K_out_stride1
             + re[None, :] * K_out_stride2,
             (k_e * cos_p - k_o * sin_p).to(tl.bfloat16),
             mask=mask_p_rope,
@@ -379,7 +402,7 @@ def rmsnorm_rope_kernel_3way(
         tl.store(
             K_out_ptr
             + h * K_out_stride0
-            + rs[:, None] * K_out_stride1
+            + rs_safe[:, None] * K_out_stride1
             + ro[None, :] * K_out_stride2,
             (k_e * sin_p + k_o * cos_p).to(tl.bfloat16),
             mask=mask_p_rope,

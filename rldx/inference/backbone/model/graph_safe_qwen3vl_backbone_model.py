@@ -65,10 +65,7 @@ class GraphSafeQwen3VLBackbone(nn.Module):
         # Determine num_views for compression (matches vanilla LayerWrapper logic)
         iwe = vl_input.get("image_wise_encoding")
         if iwe is not None:
-            if isinstance(iwe, torch.Tensor):
-                iwe_val = bool(iwe.flatten()[0].item())
-            else:
-                iwe_val = bool(iwe)
+            iwe_val = iwe.item() if isinstance(iwe, torch.Tensor) else bool(iwe)
         else:
             iwe_val = False
         compress_num_views = vl_input.get("num_views") if iwe_val else None
@@ -85,6 +82,7 @@ class GraphSafeQwen3VLBackbone(nn.Module):
         self.embed_tokens = self.gs_text._text_model.embed_tokens
         self.qwen_linear = backbone.qwen_linear
         self.image_token_id = inner_model.config.image_token_id
+
         # Pad id used by ``update_input_ids`` to refill a shorter instruction
         # up to the baked length. Falls back to Qwen ``<|endoftext|>`` (151643)
         # when the config carries no explicit pad token.
@@ -212,13 +210,20 @@ class GraphSafeQwen3VLBackbone(nn.Module):
         hidden_states = lm_out.last_hidden_state
 
         # cog-token extract — must match the vanilla backbone slice at
-        # ``rldx/model/modules/backbone/adapter.py`` (cog_mode='cog_only').
-        # Without the slice GraphSafeVLM and CustomVLMChain disagree on
-        # token count: the custom chain slices unconditionally on
-        # ``n_cog_tokens > 0`` (``custom_backbone_chain.py``) — Path D
-        # crashes at compile time and Path C silently mis-computes
-        # (cos_sim ≈ 0.96 vs vanilla).
-        if self.n_cog_tokens > 0 and self.cog_mode == "cog_only":
+        # ``rldx/model/modules/backbone/adapter.py:571`` (cog_mode='cog_only').
+        # Issue #29 Phase 2 renamed the string value ``meta_only`` →
+        # ``cog_only``; ``patch_checkpoint.py`` migrates the saved config,
+        # but this comparison was previously stale.  Without the slice
+        # GraphSafeVLM and CustomVLMChain disagree on token count: the
+        # custom chain slices unconditionally on ``n_cog_tokens > 0``
+        # (``custom_backbone_chain.py:186``) so a stale string here makes
+        # ``gs_msat.n_vl`` get baked at the unsliced 234 while the custom
+        # VLM hands MSAT the sliced 64 — Path D crashes at compile time
+        # and Path C silently mis-computes (cos_sim ≈ 0.96 vs vanilla).
+        # Accept legacy ``meta_only`` for back-compat with any
+        # checkpoint that pre-dates the rename and slipped past the
+        # patch script.
+        if self.n_cog_tokens > 0 and self.cog_mode in ("cog_only", "meta_only"):
             hidden_states = hidden_states[:, -self.n_cog_tokens :, :]
 
         # Projection
