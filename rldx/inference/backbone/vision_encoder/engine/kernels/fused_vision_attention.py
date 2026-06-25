@@ -167,39 +167,25 @@ def _fused_vision_attention_softmax(
 # program_id(2) packs (split_idx, seq_idx); NUM_SPLITS is constexpr so divmod
 # folds to constant ops.
 
+# NUM_SPLITS -> (BLOCK_S, BLOCK_P, num_stages, num_warps). Hand-curated subset
+# (NOT a full Cartesian product). NUM_SPLITS=1 kept for autotune comparability
+# with the direct kernel; higher splits for smaller SEQ_LEN (more parallelism).
+_SPLIT_CFG = {
+    1: [(32, 32, 2, 4), (32, 64, 2, 8), (64, 32, 2, 8), (64, 64, 2, 8),
+        (64, 64, 3, 8), (128, 64, 2, 8), (128, 128, 2, 8)],
+    2: [(16, 32, 2, 4), (32, 32, 2, 4), (32, 32, 2, 8), (32, 64, 2, 8),
+        (64, 32, 2, 8), (64, 64, 2, 8), (64, 64, 3, 8)],
+    4: [(16, 16, 2, 2), (16, 32, 2, 4), (32, 16, 2, 4), (32, 32, 2, 4),
+        (32, 32, 2, 8), (32, 64, 2, 8), (64, 32, 2, 8), (64, 64, 2, 8)],
+    8: [(16, 16, 2, 2), (16, 16, 2, 4), (16, 32, 2, 4), (32, 16, 2, 4),
+        (32, 32, 2, 4), (32, 32, 2, 8)],
+}
 _SPLIT_CONFIGS = [
-    # NUM_SPLITS = 1 (kept for autotune comparability with direct)
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 32, "NUM_SPLITS": 1}, num_stages=2, num_warps=4),
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 64, "NUM_SPLITS": 1}, num_stages=2, num_warps=8),
-    triton.Config({"BLOCK_S": 64, "BLOCK_P": 32, "NUM_SPLITS": 1}, num_stages=2, num_warps=8),
-    triton.Config({"BLOCK_S": 64, "BLOCK_P": 64, "NUM_SPLITS": 1}, num_stages=2, num_warps=8),
-    triton.Config({"BLOCK_S": 64, "BLOCK_P": 64, "NUM_SPLITS": 1}, num_stages=3, num_warps=8),
-    triton.Config({"BLOCK_S": 128, "BLOCK_P": 64, "NUM_SPLITS": 1}, num_stages=2, num_warps=8),
-    triton.Config({"BLOCK_S": 128, "BLOCK_P": 128, "NUM_SPLITS": 1}, num_stages=2, num_warps=8),
-    # NUM_SPLITS = 2
-    triton.Config({"BLOCK_S": 16, "BLOCK_P": 32, "NUM_SPLITS": 2}, num_stages=2, num_warps=4),
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 32, "NUM_SPLITS": 2}, num_stages=2, num_warps=4),
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 32, "NUM_SPLITS": 2}, num_stages=2, num_warps=8),
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 64, "NUM_SPLITS": 2}, num_stages=2, num_warps=8),
-    triton.Config({"BLOCK_S": 64, "BLOCK_P": 32, "NUM_SPLITS": 2}, num_stages=2, num_warps=8),
-    triton.Config({"BLOCK_S": 64, "BLOCK_P": 64, "NUM_SPLITS": 2}, num_stages=2, num_warps=8),
-    triton.Config({"BLOCK_S": 64, "BLOCK_P": 64, "NUM_SPLITS": 2}, num_stages=3, num_warps=8),
-    # NUM_SPLITS = 4
-    triton.Config({"BLOCK_S": 16, "BLOCK_P": 16, "NUM_SPLITS": 4}, num_stages=2, num_warps=2),
-    triton.Config({"BLOCK_S": 16, "BLOCK_P": 32, "NUM_SPLITS": 4}, num_stages=2, num_warps=4),
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 16, "NUM_SPLITS": 4}, num_stages=2, num_warps=4),
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 32, "NUM_SPLITS": 4}, num_stages=2, num_warps=4),
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 32, "NUM_SPLITS": 4}, num_stages=2, num_warps=8),
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 64, "NUM_SPLITS": 4}, num_stages=2, num_warps=8),
-    triton.Config({"BLOCK_S": 64, "BLOCK_P": 32, "NUM_SPLITS": 4}, num_stages=2, num_warps=8),
-    triton.Config({"BLOCK_S": 64, "BLOCK_P": 64, "NUM_SPLITS": 4}, num_stages=2, num_warps=8),
-    # NUM_SPLITS = 8 (for smallest M; maximum parallelism)
-    triton.Config({"BLOCK_S": 16, "BLOCK_P": 16, "NUM_SPLITS": 8}, num_stages=2, num_warps=2),
-    triton.Config({"BLOCK_S": 16, "BLOCK_P": 16, "NUM_SPLITS": 8}, num_stages=2, num_warps=4),
-    triton.Config({"BLOCK_S": 16, "BLOCK_P": 32, "NUM_SPLITS": 8}, num_stages=2, num_warps=4),
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 16, "NUM_SPLITS": 8}, num_stages=2, num_warps=4),
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 32, "NUM_SPLITS": 8}, num_stages=2, num_warps=4),
-    triton.Config({"BLOCK_S": 32, "BLOCK_P": 32, "NUM_SPLITS": 8}, num_stages=2, num_warps=8),
+    triton.Config(
+        {"BLOCK_S": bs, "BLOCK_P": bp, "NUM_SPLITS": sp}, num_stages=ns, num_warps=nw
+    )
+    for sp, lst in _SPLIT_CFG.items()
+    for (bs, bp, ns, nw) in lst
 ]
 
 

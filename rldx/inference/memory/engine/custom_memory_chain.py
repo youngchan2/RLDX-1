@@ -79,49 +79,6 @@ class CustomMemoryChain(nn.Module):
             self.register_buffer("cos", cos)
             self.register_buffer("signed_sin", signed_sin)
 
-        # Attention backend: False = fused Triton (RoPE + block-causal),
-        # True = eager baked-RoPE + F.sdpa. Toggle on the instance (e.g. bench Path F).
-        self._use_sdpa = False
-
-    def _sdpa_attention(self, qkv, num_heads, head_dim):
-        """SDPA path: eager baked-RoPE + F.scaled_dot_product_attention (block-causal).
-
-        Numerically matches ``mem::fused_attention``: ``signed_sin`` already has
-        the rotate_half sign folded in, so RoPE is ``q*cos + swap_half(q)*signed_sin``
-        (swap the two head halves, no negation). Mask is block-causal — position i
-        attends j iff ``i // block >= j // block`` (block == 1 → standard causal).
-        scale = head_dim**-0.5 (matches the kernel's 1/sqrt(D)).
-        """
-        M = qkv.shape[0]
-        QD = num_heads * head_dim
-        half = head_dim // 2
-        scaling = head_dim ** -0.5
-
-        q = qkv[:, :QD].reshape(M, num_heads, head_dim).float()
-        k = qkv[:, QD : 2 * QD].reshape(M, num_heads, head_dim).float()
-        v = qkv[:, 2 * QD : 3 * QD].reshape(M, num_heads, head_dim)
-
-        cos = self.cos.view(M, 1, head_dim)
-        sin = self.signed_sin.view(M, 1, head_dim)
-        q_sw = torch.cat((q[..., half:], q[..., :half]), dim=-1)
-        k_sw = torch.cat((k[..., half:], k[..., :half]), dim=-1)
-        q = (q * cos + q_sw * sin).to(v.dtype)
-        k = (k * cos + k_sw * sin).to(v.dtype)
-
-        # (M, H, D) -> (1, H, M, D): one block-causal sequence
-        q = q.reshape(1, M, num_heads, head_dim).transpose(1, 2)
-        k = k.reshape(1, M, num_heads, head_dim).transpose(1, 2)
-        v = v.reshape(1, M, num_heads, head_dim).transpose(1, 2)
-
-        blk = self.attn_block_size
-        if blk == 1:
-            out = F.scaled_dot_product_attention(q, k, v, is_causal=True, scale=scaling)
-        else:
-            idx = torch.arange(M, device=qkv.device)
-            mask = (idx[:, None] // blk) >= (idx[None, :] // blk)  # (M, M) bool, True = attend
-            out = F.scaled_dot_product_attention(q, k, v, attn_mask=mask, scale=scaling)
-        return out.transpose(1, 2).reshape(M, QD)  # (M, Q_DIM)
-
     def forward(self, inputs_embeds):
         """Forward pass with fused ops.
 
@@ -144,18 +101,15 @@ class CustomMemoryChain(nn.Module):
             # 1. QKV projection — single fused GEMM (cuBLAS)
             qkv = F.linear(normed.view(M, D), layer.qkv_weight)  # (M, QKV_DIM)
 
-            # 2. Attention — fused Triton (RoPE + block-causal) OR eager RoPE + F.sdpa
-            if self._use_sdpa:
-                attn_out = self._sdpa_attention(qkv, self.num_heads, self.head_dim)
-            else:
-                attn_out = torch.ops.mem.fused_attention(
-                    qkv,
-                    cos,
-                    ssin,
-                    self.num_heads,
-                    self.head_dim,
-                    self.attn_block_size,
-                )  # (M, Q_DIM)
+            # 2. Attention — fused Triton (RoPE + block-causal SDPA)
+            attn_out = torch.ops.mem.fused_attention(
+                qkv,
+                cos,
+                ssin,
+                self.num_heads,
+                self.head_dim,
+                self.attn_block_size,
+            )  # (M, Q_DIM)
 
             # 3. O projection (cuBLAS)
             attn_out = F.linear(attn_out, layer.o_proj_weight).view(B, M, -1)

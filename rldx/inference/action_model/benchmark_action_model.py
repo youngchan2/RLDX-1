@@ -398,10 +398,65 @@ def main():
         traceback.print_exc()
 
     # =========================================================================
-    # Path D: CustomActionHeadChain + torch.compile
+    # Path D: GraphSafe + torch.compile (NO custom ops)
     # =========================================================================
     print(f"\n{'=' * 60}")
-    print("Path D: CustomActionHeadChain + torch.compile")
+    print("Path D: GraphSafe + torch.compile (no custom ops)")
+    print(f"{'=' * 60}")
+    try:
+        print("  Building GraphSafeActionModel...")
+        physics_override = args.physics_hist_len is not None or args.physics_fut_len is not None
+        if physics_override and n_physics > 0:
+            gs_action_model_compile = GraphSafeActionModel(
+                action_model=components["action_model"],
+                n_vl=N_vl,
+                n_sa_pure=N_sa,
+                action_horizon=action_horizon,
+                action_dim=dims["action_dim"],
+                num_inference_timesteps=denoising_steps,
+                device=device,
+                dtype=dtype,
+                physics_cond_encoder=components.get("physics_cond_encoder"),
+                physics_fut_encoder=components.get("physics_fut_encoder"),
+                physics_decoder=components.get("physics_decoder"),
+                physics_hist_len=physics_hist_len,
+                physics_fut_len=physics_fut_len,
+                physics_dim=physics_dim,
+            ).eval()
+        else:
+            gs_action_model_compile = GraphSafeActionModel(
+                action_model=components["action_model"],
+                n_vl=N_vl,
+                n_sa_pure=N_sa,
+                action_horizon=action_horizon,
+                action_dim=dims["action_dim"],
+                num_inference_timesteps=denoising_steps,
+                device=device,
+                dtype=dtype,
+            ).eval()
+
+        torch._dynamo.reset()
+        compiled_gs = torch.compile(gs_action_model_compile, mode=args.compile_mode)
+
+        print(f"  Compiling (mode={args.compile_mode})...")
+        t0 = _time.time()
+        with torch.no_grad():
+            make_gs_fn(compiled_gs)()
+        torch.cuda.synchronize()
+        build_times["D: GraphSafe+compile"] = _time.time() - t0
+        print(f"  Compilation: {build_times['D: GraphSafe+compile']:.1f}s")
+
+        run_benchmark("D: GraphSafe + compile", make_gs_fn(compiled_gs))
+        torch._dynamo.reset()
+    except Exception as e:
+        print(f"  [GraphSafe + compile] Failed: {e}")
+        traceback.print_exc()
+
+    # =========================================================================
+    # Path E: CustomActionHeadChain + torch.compile
+    # =========================================================================
+    print(f"\n{'=' * 60}")
+    print("Path E: CustomActionHeadChain + torch.compile")
     print(f"{'=' * 60}")
     try:
         if "gs_action_model" not in locals():
@@ -449,71 +504,12 @@ def main():
                 if i == 0:
                     print("    Compilation warmup 1/5 done")
         torch.cuda.synchronize()
-        build_times["D: CustomChain"] = _time.time() - t0
-        print(f"    Compilation complete ({build_times['D: CustomChain']:.1f}s)")
+        build_times["E: CustomChain"] = _time.time() - t0
+        print(f"    Compilation complete ({build_times['E: CustomChain']:.1f}s)")
 
-        run_benchmark("D: CustomActionHeadChain", make_gs_fn(compiled_ah))
+        run_benchmark("E: CustomActionHeadChain", make_gs_fn(compiled_ah))
     except Exception as e:
         print(f"  [CustomChain] Failed: {e}")
-        traceback.print_exc()
-
-    # =========================================================================
-    # Path E: GraphSafe + torch.compile (NO custom ops)
-    # =========================================================================
-    # Same graph-safe action model as Path C (pure PyTorch, no custom Triton
-    # chain), but accelerated with torch.compile instead of CUDA-graph capture —
-    # the all-PyTorch counterpart to the custom chain (D). A fresh instance is
-    # built so Path C's CUDA-graph-captured model is not reused.
-    print(f"\n{'=' * 60}")
-    print("Path E: GraphSafe + torch.compile (no custom ops)")
-    print(f"{'=' * 60}")
-    try:
-        print("  Building GraphSafeActionModel...")
-        physics_override = args.physics_hist_len is not None or args.physics_fut_len is not None
-        if physics_override and n_physics > 0:
-            gs_action_model_compile = GraphSafeActionModel(
-                action_model=components["action_model"],
-                n_vl=N_vl,
-                n_sa_pure=N_sa,
-                action_horizon=action_horizon,
-                action_dim=dims["action_dim"],
-                num_inference_timesteps=denoising_steps,
-                device=device,
-                dtype=dtype,
-                physics_cond_encoder=components.get("physics_cond_encoder"),
-                physics_fut_encoder=components.get("physics_fut_encoder"),
-                physics_decoder=components.get("physics_decoder"),
-                physics_hist_len=physics_hist_len,
-                physics_fut_len=physics_fut_len,
-                physics_dim=physics_dim,
-            ).eval()
-        else:
-            gs_action_model_compile = GraphSafeActionModel(
-                action_model=components["action_model"],
-                n_vl=N_vl,
-                n_sa_pure=N_sa,
-                action_horizon=action_horizon,
-                action_dim=dims["action_dim"],
-                num_inference_timesteps=denoising_steps,
-                device=device,
-                dtype=dtype,
-            ).eval()
-
-        torch._dynamo.reset()
-        compiled_gs = torch.compile(gs_action_model_compile, mode=args.compile_mode)
-
-        print(f"  Compiling (mode={args.compile_mode})...")
-        t0 = _time.time()
-        with torch.no_grad():
-            make_gs_fn(compiled_gs)()
-        torch.cuda.synchronize()
-        build_times["E: GraphSafe+compile"] = _time.time() - t0
-        print(f"  Compilation: {build_times['E: GraphSafe+compile']:.1f}s")
-
-        run_benchmark("E: GraphSafe + compile", make_gs_fn(compiled_gs))
-        torch._dynamo.reset()
-    except Exception as e:
-        print(f"  [GraphSafe + compile] Failed: {e}")
         traceback.print_exc()
 
     # =========================================================================

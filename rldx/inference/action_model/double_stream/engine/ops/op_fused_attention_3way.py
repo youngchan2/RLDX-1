@@ -10,6 +10,18 @@ import torch
 import torch.nn.functional as F
 
 
+# BLOCK_S (token-tile) is autotuned inside rmsnorm_rope_kernel_3way: it is a pure
+# pointwise kernel (no tl.dot), so the only knob is occupancy (grid_x =
+# ceil(TOTAL/BLOCK_S)). The old fixed BLOCK_S=128 gave ~48 CTAs on a 114-SM H100
+# and the kernel cost 3.57ms/iter (Path D lost to E on allex/droid); autotuning
+# small BLOCK_S brings it to ~0.7-1ms. Do NOT pass BLOCK_S in the launch — the
+# @triton.autotune config injects it (and the grid lambda reads meta["BLOCK_S"]).
+
+# RoPE single-pass (register reshape) vs legacy two-pass (GMEM reload). Default
+# single-pass; overridable at runtime to A/B the single-pass win.
+_SINGLE_PASS = True
+
+
 @torch.library.custom_op("ds::fused_attention_3way", mutates_args=())
 def fused_attention_3way(
     sa_qkv: torch.Tensor,
@@ -97,7 +109,6 @@ def fused_attention_3way(
         p_rope_sin,
         p_rope_sin.stride(0),
         p_rope_sin.stride(1),
-        BLOCK_S=128,
         BLOCK_N=D,
         D=D,
         H=H,
@@ -106,6 +117,7 @@ def fused_attention_3way(
         N_VL=n_vl,
         N_SA=n_sa,
         N_P=n_p,
+        SINGLE_PASS=_SINGLE_PASS,
     )
 
     attn_out = F.scaled_dot_product_attention(

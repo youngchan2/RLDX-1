@@ -9,6 +9,12 @@ import torch
 import torch.nn.functional as F
 
 
+# BLOCK_S is autotuned inside rmsnorm_rope_kernel (pure pointwise; occupancy is
+# the only knob). Do NOT pass BLOCK_S — @triton.autotune injects it. _SINGLE_PASS
+# toggles register single-pass RoPE (default) vs legacy two-pass (A/B only).
+_SINGLE_PASS = True
+
+
 @torch.library.custom_op("ds::fused_attention_2way", mutates_args=())
 def fused_attention(
     sa_qkv: torch.Tensor,
@@ -64,7 +70,6 @@ def fused_attention(
         rope_sin,
         rope_sin.stride(0),
         rope_sin.stride(1),
-        BLOCK_S=128,
         BLOCK_N=D,
         D=D,
         H=H,
@@ -72,6 +77,7 @@ def fused_attention(
         N=N,
         N_VL=n_vl,
         N_SA=n_sa,
+        SINGLE_PASS=_SINGLE_PASS,
     )
 
     attn_out = F.scaled_dot_product_attention(

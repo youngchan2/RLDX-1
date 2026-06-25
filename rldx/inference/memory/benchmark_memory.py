@@ -12,8 +12,6 @@ Benchmark paths (always run in order):
   B: Torch Inductor (vanilla)          — torch.compile on vanilla module (compiler only)
   C: GraphSafe + CUDA Graph            — GraphSafe wrapping + CUDA Graph capture
   D: Custom Chain                      — GraphSafe + custom Triton kernels + torch.compile
-  F: SDPA Chain                        — Custom chain but attention = eager RoPE + F.sdpa, + torch.compile
-  G: GraphSafe + compile               — Path C's graph-safe model + torch.compile (NO custom ops; compiler only)
 
 Usage:
   python inference/memory/benchmark_memory.py
@@ -136,9 +134,11 @@ def main():
         def fn():
             with torch.no_grad():
                 out = module(inputs_embeds)
-                # Path A (vanilla TransformerMemory) returns BaseModelOutputWithPast;
-                # Paths C/D return a tensor. Unwrap so all paths yield a tensor.
-                return getattr(out, "last_hidden_state", out)
+                # Vanilla ``TransformerMemory`` returns a ``BaseModelOutputWithPast``;
+                # the GraphSafe / Custom paths return the hidden-state tensor
+                # directly. Normalize to ``last_hidden_state`` so every path
+                # yields the same comparable tensor.
+                return out.last_hidden_state if hasattr(out, "last_hidden_state") else out
 
         return fn
 
@@ -208,76 +208,10 @@ def main():
         traceback.print_exc()
 
     # =========================================================================
-    # Path D: CustomMemoryChain + torch.compile
+    # Path D: GraphSafe + torch.compile (NO custom ops)
     # =========================================================================
     print(f"\n{'=' * 60}")
-    print("Path D: CustomMemoryChain + torch.compile")
-    print(f"{'=' * 60}")
-    try:
-        if "gs_memory" not in locals():
-            gs_memory = GraphSafeMemory(
-                memory_module=memory_module,
-                memory_length=K,
-                memory_n_cog_tokens=n_cog_mem,
-                device=device,
-                dtype=dtype,
-            ).eval()
-
-        print("  Building CustomMemoryChain...")
-        custom_chain = build_custom_memory_chain(gs_memory, device=device, dtype=dtype)
-
-        compiled_chain, chain_compile_time = compile_custom_memory_chain(
-            custom_chain, inputs_embeds, compile_mode=args.compile_mode
-        )
-        build_times["D: MemoryChain"] = chain_compile_time
-
-        run_benchmark("D: CustomMemoryChain", make_fn(compiled_chain))
-    except Exception as e:
-        print(f"  [MemoryChain] Failed: {e}")
-        traceback.print_exc()
-
-    # =========================================================================
-    # Path E: CustomMemoryChain (SDPA attention) + torch.compile
-    # =========================================================================
-    # Same chain as Path D (custom Triton GEMMs/epilogues), but the attention
-    # sub-op is swapped to eager baked-RoPE + F.scaled_dot_product_attention.
-    print(f"\n{'=' * 60}")
-    print("Path E: CustomMemoryChain (SDPA attn) + torch.compile")
-    print(f"{'=' * 60}")
-    try:
-        if "gs_memory" not in locals():
-            gs_memory = GraphSafeMemory(
-                memory_module=memory_module,
-                memory_length=K,
-                memory_n_cog_tokens=n_cog_mem,
-                device=device,
-                dtype=dtype,
-            ).eval()
-
-        print("  Building CustomMemoryChain (SDPA attention)...")
-        sdpa_chain = build_custom_memory_chain(gs_memory, device=device, dtype=dtype)
-        sdpa_chain._use_sdpa = True  # swap only the attention sub-op for F.sdpa
-
-        compiled_chain, chain_compile_time = compile_custom_memory_chain(
-            sdpa_chain, inputs_embeds, compile_mode=args.compile_mode
-        )
-        build_times["F: SDPA"] = chain_compile_time
-
-        run_benchmark("F: SDPA Chain", make_fn(compiled_chain))
-    except Exception as e:
-        print(f"  [SDPA Chain] Failed: {e}")
-        traceback.print_exc()
-
-    # =========================================================================
-    # Path G: GraphSafe + torch.compile (NO custom ops)
-    # =========================================================================
-    # Same graph-safe model as Path C (pure PyTorch, no custom Triton kernels),
-    # but accelerated with torch.compile instead of CUDA-graph capture. Isolates
-    # what the compiler ALONE achieves on the graph-safe model — the all-PyTorch
-    # counterpart to the custom-kernel chains (D/E/F). A fresh GraphSafeMemory is
-    # built so Path C's CUDA-graph-captured instance is not reused.
-    print(f"\n{'=' * 60}")
-    print("Path G: GraphSafe + torch.compile (no custom ops)")
+    print("Path D: GraphSafe + torch.compile (no custom ops)")
     print(f"{'=' * 60}")
     try:
         gs_memory_compile = GraphSafeMemory(
@@ -296,13 +230,42 @@ def main():
         with torch.no_grad():
             compiled_gs(inputs_embeds)
         torch.cuda.synchronize()
-        build_times["G: GraphSafe+compile"] = _time.time() - t0
-        print(f"  Compilation: {build_times['G: GraphSafe+compile']:.1f}s")
+        build_times["D: GraphSafe+compile"] = _time.time() - t0
+        print(f"  Compilation: {build_times['D: GraphSafe+compile']:.1f}s")
 
-        run_benchmark("G: GraphSafe + compile", make_fn(compiled_gs))
+        run_benchmark("D: GraphSafe + compile", make_fn(compiled_gs))
         torch._dynamo.reset()
     except Exception as e:
         print(f"  [GraphSafe + compile] Failed: {e}")
+        traceback.print_exc()
+
+    # =========================================================================
+    # Path E: CustomMemoryChain + torch.compile
+    # =========================================================================
+    print(f"\n{'=' * 60}")
+    print("Path E: CustomMemoryChain + torch.compile")
+    print(f"{'=' * 60}")
+    try:
+        if "gs_memory" not in locals():
+            gs_memory = GraphSafeMemory(
+                memory_module=memory_module,
+                memory_length=K,
+                memory_n_cog_tokens=n_cog_mem,
+                device=device,
+                dtype=dtype,
+            ).eval()
+
+        print("  Building CustomMemoryChain...")
+        custom_chain = build_custom_memory_chain(gs_memory, device=device, dtype=dtype)
+
+        compiled_chain, chain_compile_time = compile_custom_memory_chain(
+            custom_chain, inputs_embeds, compile_mode=args.compile_mode
+        )
+        build_times["E: MemoryChain"] = chain_compile_time
+
+        run_benchmark("E: CustomMemoryChain", make_fn(compiled_chain))
+    except Exception as e:
+        print(f"  [MemoryChain] Failed: {e}")
         traceback.print_exc()
 
     # =========================================================================

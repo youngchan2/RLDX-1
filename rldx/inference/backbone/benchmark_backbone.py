@@ -13,7 +13,7 @@ Benchmark paths (always run in order):
 
 Usage:
   python inference/backbone/benchmark_backbone.py
-  python inference/backbone/benchmark_backbone.py --mode all
+  python inference/backbone/benchmark_backbone.py --model-type rldx_1_midtrain_allex
 """
 
 import argparse
@@ -75,15 +75,10 @@ from utils import (  # noqa: E402
 
 # CLI
 
-_MODE_TO_MODEL_TYPE = {
-    "video": "rldx_1_pretrain",
-    "all": "rldx_1_midtrain_allex",
-}
-
-
 def parse_args():
     parser = argparse.ArgumentParser(description="Backbone Benchmark")
-    parser.add_argument("--mode", default="video", choices=list(_MODE_TO_MODEL_TYPE.keys()))
+    parser.add_argument("--model-type", type=str, default="rldx_1_pretrain")
+    parser.add_argument("--model-path", type=str, default=None)
     parser.add_argument("--num-images", type=int, default=2)
     parser.add_argument("--image-size", type=int, default=224)
     parser.add_argument("--concat-frames", action="store_true")
@@ -101,8 +96,6 @@ def parse_args():
         help="torch.compile mode for full-backbone paths. Path B fixes its own mode.",
     )
     args = parser.parse_args()
-    args.model_type = _MODE_TO_MODEL_TYPE[args.mode]
-    args.model_path = None
     return args
 
 
@@ -274,7 +267,7 @@ def main():
         # Path D = ALL custom kernels. Force vision custom too — auto mode picks
         # F.sdpa for vision on server-class GPUs (A100/H100), which would make
         # this identical to Path E.
-        _set_chain_sdpa(backbone_chain, vision=False, llm=False)
+        _set_chain_sdpa(backbone_chain, vision=True, llm=False)
         compiled_chain, chain_compile_time = compile_custom_backbone_chain(backbone_chain, pv)
         build_times["D: CustomVLM"] = chain_compile_time
 
@@ -310,7 +303,7 @@ def main():
         print("  Building CustomVLMChain (vision SDPA, LLM custom)...")
         sdpa_chain = build_custom_backbone_chain(gs_backbone)
         # Path E = vision attention via F.sdpa; LLM attention stays custom Triton.
-        _set_chain_sdpa(sdpa_chain, vision=True, llm=False)
+        _set_chain_sdpa(sdpa_chain, vision=True, llm=True)
         compiled_sdpa, t_e = compile_custom_backbone_chain(sdpa_chain, pv)
         build_times["E: SDPA attn"] = t_e
 
@@ -327,9 +320,6 @@ def main():
     # =========================================================================
     # Path F: GraphSafe backbone + torch.compile (NO custom ops)
     # =========================================================================
-    # The graph-safe backbone forward (patched at the Path C build) run under
-    # torch.compile — the all-PyTorch, compiler-only counterpart to the custom
-    # chains (D/E). No custom Triton kernels anywhere.
     print(f"\n{'=' * 60}")
     print("Path F: GraphSafe + torch.compile (no custom ops)")
     print(f"{'=' * 60}")

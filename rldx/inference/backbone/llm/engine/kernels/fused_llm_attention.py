@@ -61,38 +61,28 @@ SPLIT_M_THRESHOLD = 128
 # ---------------------------------------------------------------------------
 
 
+# NUM_SPLITS -> (BLOCK_S, BLOCK_P, num_stages, num_warps). Hand-curated subset
+# (NOT a full Cartesian product): BS_EFF = BLOCK_S * GROUP_SIZE (G=4 on Qwen3) is
+# kept small for register pressure of the (BS_EFF, D) Q tile / O_acc. NUM_SPLITS
+# >= 2 only (NUM_SPLITS=1 is handled by the direct kernel).
+_SPLIT_CFG = {
+    2: [(16, 16, 2, 2), (16, 16, 2, 4), (16, 32, 2, 4), (16, 32, 3, 4),
+        (16, 64, 2, 4), (16, 64, 2, 8), (16, 64, 3, 8), (32, 32, 2, 4),
+        (32, 32, 2, 8), (32, 64, 2, 8), (32, 64, 3, 8)],
+    4: [(16, 16, 2, 2), (16, 16, 2, 4), (16, 32, 2, 2), (16, 32, 2, 4),
+        (16, 32, 3, 4), (16, 64, 2, 4), (16, 64, 2, 8), (32, 32, 2, 4),
+        (32, 32, 2, 8)],
+    8: [(16, 16, 2, 2), (16, 16, 2, 4), (16, 32, 2, 2), (16, 32, 2, 4)],
+}
+
+
 @triton.autotune(
     configs=[
-        # BS_EFF = BLOCK_S * GROUP_SIZE (G=4 on Qwen3); kept small due to
-        # register pressure of (BS_EFF, D) Q tile and (BS_EFF, D) O_acc.
-        # NUM_SPLITS >= 2 only; NUM_SPLITS=1 is handled by the direct kernel.
-        # --- NUM_SPLITS = 2 ---
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 16, "NUM_SPLITS": 2}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 16, "NUM_SPLITS": 2}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 32, "NUM_SPLITS": 2}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 32, "NUM_SPLITS": 2}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 64, "NUM_SPLITS": 2}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 64, "NUM_SPLITS": 2}, num_stages=2, num_warps=8),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 64, "NUM_SPLITS": 2}, num_stages=3, num_warps=8),
-        triton.Config({"BLOCK_S": 32, "BLOCK_P": 32, "NUM_SPLITS": 2}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_S": 32, "BLOCK_P": 32, "NUM_SPLITS": 2}, num_stages=2, num_warps=8),
-        triton.Config({"BLOCK_S": 32, "BLOCK_P": 64, "NUM_SPLITS": 2}, num_stages=2, num_warps=8),
-        triton.Config({"BLOCK_S": 32, "BLOCK_P": 64, "NUM_SPLITS": 2}, num_stages=3, num_warps=8),
-        # --- NUM_SPLITS = 4 ---
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 16, "NUM_SPLITS": 4}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 16, "NUM_SPLITS": 4}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 32, "NUM_SPLITS": 4}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 32, "NUM_SPLITS": 4}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 32, "NUM_SPLITS": 4}, num_stages=3, num_warps=4),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 64, "NUM_SPLITS": 4}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 64, "NUM_SPLITS": 4}, num_stages=2, num_warps=8),
-        triton.Config({"BLOCK_S": 32, "BLOCK_P": 32, "NUM_SPLITS": 4}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_S": 32, "BLOCK_P": 32, "NUM_SPLITS": 4}, num_stages=2, num_warps=8),
-        # --- NUM_SPLITS = 8 (smallest M) ---
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 16, "NUM_SPLITS": 8}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 16, "NUM_SPLITS": 8}, num_stages=2, num_warps=4),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 32, "NUM_SPLITS": 8}, num_stages=2, num_warps=2),
-        triton.Config({"BLOCK_S": 16, "BLOCK_P": 32, "NUM_SPLITS": 8}, num_stages=2, num_warps=4),
+        triton.Config(
+            {"BLOCK_S": bs, "BLOCK_P": bp, "NUM_SPLITS": sp}, num_stages=ns, num_warps=nw
+        )
+        for sp, lst in _SPLIT_CFG.items()
+        for (bs, bp, ns, nw) in lst
     ],
     key=["M"],
 )
