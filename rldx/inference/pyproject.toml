@@ -1,0 +1,86 @@
+# Dedicated venv config for the RLDX inference optimization suite.
+#
+# This subdir needs a DIFFERENT environment from the repo root: the kernels
+# (Path B/D) target sm_120 (Blackwell / RTX 5090) and require
+# torch 2.10.0 + CUDA 13.0, whereas the root ``.venv`` is torch 2.7/cu126.
+#
+# Mirrors the proven cu130 env from ``Isaac-GR00T-AlinVLA/pyproject.toml``.
+#
+# Create the venv here with:
+#     cd rldx/inference
+#     export CUDA_HOME=/usr/local/cuda-13.0
+#     export PATH=/usr/local/cuda-13.0/bin:$PATH
+#     export FLASH_ATTN_CUDA_ARCHS="120"   # restrict flash-attn source build to sm_120 only
+#     uv sync
+#
+# ``FLASH_ATTN_CUDA_ARCHS`` MUST be exported in the shell before ``uv sync`` —
+# it is a build-time env var and cannot be expressed in this pyproject (uv's
+# ``extra-build-dependencies`` below only adds build deps, not env vars).
+# Without it, flash-attn compiles every CUDA arch (very slow); "120" targets
+# Blackwell / RTX 5090 exclusively.
+#
+# ``package = false`` keeps this a venv-only (virtual) project — uv installs
+# the dependencies without trying to build ``rldx.inference`` as a package
+# (the ``rldx`` package itself is resolved via the repo root on sys.path by
+# ``_path.py`` at runtime).
+
+[project]
+name = "rldx-inference"
+version = "0.1.0"
+requires-python = "==3.10.*"
+dependencies = [
+    "albumentations==1.4.18",
+    "av==15.0.0",
+    "diffusers==0.35.1",
+    "dm-tree==0.1.8",
+    "lmdb==1.7.5",
+    "msgpack==1.1.0",
+    "msgpack-numpy==0.4.8",
+    "pandas==2.2.3",
+    "peft==0.17.1",
+    "termcolor==3.2.0",
+    "torch==2.10.0",
+    "torchvision==0.25.0",
+    "transformers==4.57.0",
+    "tyro==0.9.17",
+    "flash-attn==2.7.4.post1",
+    "click==8.1.8",
+    "datasets==3.6.0",
+    "einops==0.8.1",
+    "gymnasium==1.2.2",
+    "matplotlib==3.10.1",
+    "numpy==1.26.4",
+    "omegaconf==2.3.0",
+    "scipy==1.15.3",
+    "torchcodec==0.4.0",
+    "wandb==0.23.0",
+    "pyzmq==27.0.1",
+    "deepspeed==0.17.6",
+    "moviepy==1.0.3",
+    "opencv-contrib-python-headless==4.11.0.86",
+]
+
+[project.optional-dependencies]
+dev = [
+    "ruff",
+    "ipython",
+]
+tensorrt = [
+    "onnx>=1.20.0",
+    "tensorrt>=10.14.1.48.post1",
+]
+
+[tool.uv]
+package = false
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu130" }
+torchvision = { index = "pytorch-cu130" }
+
+[tool.uv.extra-build-dependencies]
+flash-attn = ["torch==2.10.0", "numpy==1.26.4", "ninja"]
